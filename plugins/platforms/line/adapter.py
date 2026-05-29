@@ -76,7 +76,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote as _urlquote
 
 logger = logging.getLogger(__name__)
@@ -91,10 +91,12 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
     cache_image_from_bytes,
 )
 from gateway.config import Platform
+from gateway.session import SessionSource
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +106,7 @@ from gateway.config import Platform
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 LINE_LOADING_URL = "https://api.line.me/v2/bot/chat/loading/start"
+LINE_REACTION_URL = "https://api.line.me/v2/bot/message/{message_id}/reaction"
 LINE_CONTENT_URL_FMT = "https://api-data.line.me/v2/bot/message/{message_id}/content"
 LINE_BOT_INFO_URL = "https://api.line.me/v2/bot/info"
 
@@ -351,6 +354,54 @@ class RequestCache:
         return removed
 
 
+
+
+# ---------------------------------------------------------------------------
+# Persistent bot-sent message ID store
+# ---------------------------------------------------------------------------
+
+class _LineIdStore:
+    """Persist bot-sent LINE message IDs across restarts."""
+
+    def __init__(self, path: str, maxlen: int = 1000) -> None:
+        self._path = path
+        self._maxlen = maxlen
+        self._ids: set = set()
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            import json as _json
+            with open(self._path) as f:
+                data = _json.load(f)
+            self._ids = set(data.get("ids", []))
+        except Exception:
+            self._ids = set()
+
+    def add(self, msg_ids: list) -> None:
+        if not msg_ids:
+            return
+        self._ids.update(msg_ids)
+        if len(self._ids) > self._maxlen:
+            # trim oldest – convert to list, drop first N
+            overflow = len(self._ids) - self._maxlen
+            trimmed = list(self._ids)[overflow:]
+            self._ids = set(trimmed)
+        self._flush()
+
+    def __contains__(self, item: str) -> bool:
+        return item in self._ids
+
+    def _flush(self) -> None:
+        try:
+            import json as _json, os as _os
+            tmp = self._path + ".tmp"
+            with open(tmp, "w") as f:
+                _json.dump({"ids": list(self._ids)}, f)
+            _os.replace(tmp, self._path)
+        except Exception:
+            pass
+
 # ---------------------------------------------------------------------------
 # Inbound dedup
 # ---------------------------------------------------------------------------
@@ -443,7 +494,7 @@ class _LineClient:
             "Content-Type": "application/json",
         }
 
-    async def reply(self, reply_token: str, messages: List[Dict[str, Any]]) -> None:
+    async def reply(self, reply_token: str, messages: List[Dict[str, Any]]) -> List[str]:
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=self._timeout)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
@@ -455,8 +506,10 @@ class _LineClient:
                 if resp.status >= 400:
                     body = await resp.text()
                     raise RuntimeError(f"LINE reply {resp.status}: {body[:200]}")
+                data = await resp.json()
+                return [m["id"] for m in data.get("sentMessages", []) if "id" in m]
 
-    async def push(self, chat_id: str, messages: List[Dict[str, Any]]) -> None:
+    async def push(self, chat_id: str, messages: List[Dict[str, Any]]) -> List[str]:
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=self._timeout)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
@@ -468,6 +521,8 @@ class _LineClient:
                 if resp.status >= 400:
                     body = await resp.text()
                     raise RuntimeError(f"LINE push {resp.status}: {body[:200]}")
+                data = await resp.json()
+                return [m["id"] for m in data.get("sentMessages", []) if "id" in m]
 
     async def loading(self, chat_id: str, seconds: int = 60) -> None:
         """Loading indicator (DM only). LINE rejects this for groups/rooms."""
@@ -486,6 +541,23 @@ class _LineClient:
                 )
         except Exception as exc:  # best-effort; never raise
             logger.debug("LINE loading indicator failed: %s", exc)
+
+    async def react(self, message_id: str, reaction_type: str = "like") -> None:
+        """Add an emoji reaction to a message (best-effort)."""
+        if not message_id:
+            return
+        import aiohttp
+        url = LINE_REACTION_URL.format(message_id=message_id)
+        try:
+            timeout = aiohttp.ClientTimeout(total=5.0)
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                resp = await session.post(url, headers=self._headers,
+                                          json={"reactionType": reaction_type})
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.debug("LINE react %s: %s", resp.status, body[:100])
+        except Exception as exc:
+            logger.debug("LINE react failed: %s", exc)
 
     async def fetch_content(self, message_id: str) -> bytes:
         """Download an inbound media message's binary content."""
@@ -684,7 +756,7 @@ class LineAdapter(BasePlatformAdapter):
         _raw_aliases = (
             os.getenv("LINE_MENTION_ALIASES", "") or extra.get("mention_aliases", "")
         )
-        self._mention_aliases: list = [a.strip() for a in str(_raw_aliases).split(",") if a.strip()]
+        self._mention_aliases: list = [a.strip() for a in str(_raw_aliases).split(',') if a.strip()]
 
         # Slow-LLM postback button threshold
         try:
@@ -720,6 +792,11 @@ class LineAdapter(BasePlatformAdapter):
         self._site = None  # aiohttp.web.TCPSite
         self._reply_tokens: Dict[str, Tuple[str, float]] = {}  # chat_id → (token, expiry)
         self._quote_tokens: Dict[str, str] = {}  # chat_id → quoteToken
+        _id_store_path = os.path.join(
+            os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+            "line_sent_ids.json",
+        )
+        self._bot_message_ids = _LineIdStore(_id_store_path)
         self._cache = RequestCache()
         self._dedup = _MessageDeduplicator()
         self._bot_user_id: Optional[str] = None
@@ -950,6 +1027,10 @@ class LineAdapter(BasePlatformAdapter):
                 if not is_mentioned:
                     is_mentioned = any(f"@{a}" in raw_text for a in self._mention_aliases)
             if not is_mentioned:
+                quoted_id = msg.get("quotedMessageId", "")
+                if quoted_id and quoted_id in self._bot_message_ids:
+                    is_mentioned = True
+            if not is_mentioned:
                 return
 
         # Stash the reply token for outbound use.
@@ -970,6 +1051,9 @@ class LineAdapter(BasePlatformAdapter):
 
         if msg_type == "text":
             text = msg.get("text", "") or ""
+            quote_content = msg.get("quote", {}).get("content", "")
+            if quote_content:
+                text = f"[引用訊息：{quote_content}]\n\n{text}"
         elif msg_type in {"image", "audio", "video", "file"}:
             local_path = await self._download_media(message_id, msg_type)
             if local_path:
@@ -1038,13 +1122,15 @@ class LineAdapter(BasePlatformAdapter):
             chunks = split_for_line(strip_markdown_preserving_urls(str(payload)))
             messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
             try:
-                await self._client.reply(reply_token, messages)
+                sent_ids = await self._client.reply(reply_token, messages)
+                self._bot_message_ids.add(sent_ids or [])
                 self._cache.mark_delivered(request_id)
                 self._pending_buttons.pop(chat_id, None)
             except Exception as exc:
                 logger.warning("LINE: postback reply failed (%s); falling back to push", exc)
                 try:
-                    await self._client.push(chat_id, messages)
+                    sent_ids = await self._client.push(chat_id, messages)
+                    self._bot_message_ids.add(sent_ids or [])
                     self._cache.mark_delivered(request_id)
                     self._pending_buttons.pop(chat_id, None)
                 except Exception as exc2:
@@ -1139,14 +1225,16 @@ class LineAdapter(BasePlatformAdapter):
         token, used_reply = self._consume_reply_token(chat_id)
         if used_reply and not force_push:
             try:
-                await self._client.reply(token, messages)
+                sent_ids = await self._client.reply(token, messages)
+                self._bot_message_ids.add(sent_ids or [])
                 return SendResult(success=True, message_id=token)
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
                 # fall through to push
 
         try:
-            await self._client.push(chat_id, messages)
+            sent_ids = await self._client.push(chat_id, messages)
+            self._bot_message_ids.add(sent_ids or [])
             return SendResult(success=True, message_id=None)
         except Exception as exc:
             logger.error("LINE: push send failed: %s", exc)
@@ -1164,6 +1252,20 @@ class LineAdapter(BasePlatformAdapter):
         if not token or time.time() >= expires_at:
             return "", False
         return token, True
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """React with 👀 when bot starts processing a message."""
+        if self._client and event.message_id:
+            asyncio.create_task(self._client.react(event.message_id, "wow"))
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        """React with ✅ on success or ❌ on failure/cancel."""
+        if not self._client or not event.message_id:
+            return
+        if outcome == ProcessingOutcome.SUCCESS:
+            asyncio.create_task(self._client.react(event.message_id, "like"))
+        else:
+            asyncio.create_task(self._client.react(event.message_id, "sad"))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Trigger LINE's loading-animation indicator (DM only)."""
@@ -1619,8 +1721,8 @@ def interactive_setup() -> None:
         suffix = " [keep current]" if existing else ""
         try:
             if secret:
-                from hermes_cli.secret_prompt import masked_secret_prompt
-                value = masked_secret_prompt(f"{prompt}{suffix}: ")
+                import getpass
+                value = getpass.getpass(f"{prompt}{suffix}: ")
             else:
                 value = input(f"{prompt}{suffix}: ").strip()
         except (EOFError, KeyboardInterrupt):
