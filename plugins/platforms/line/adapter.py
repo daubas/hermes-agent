@@ -282,6 +282,7 @@ class _CacheEntry:
     chat_id: str = ""
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    quote_token: str = ""
 
 
 class RequestCache:
@@ -401,6 +402,63 @@ class _LineIdStore:
             _os.replace(tmp, self._path)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Group context buffer — silent observer for non-mention messages
+# ---------------------------------------------------------------------------
+
+_GROUP_CTX_MAX = 30
+_GROUP_CTX_TRIM_TO = 20
+_GROUP_CTX_EXPIRY = 1800      # 30 minutes
+_NAME_CACHE_TTL = 3600        # 1 hour
+
+
+class _GroupMsg:
+    __slots__ = ("ts", "display_name", "text")
+
+    def __init__(self, display_name: str, text: str) -> None:
+        self.ts = time.time()
+        self.display_name = display_name
+        self.text = text
+
+
+class _GroupContextBuffer:
+    def __init__(self) -> None:
+        self._msgs: List[_GroupMsg] = []
+        self._dropped: int = 0
+
+    def add(self, display_name: str, text: str) -> None:
+        self._msgs.append(_GroupMsg(display_name, text))
+        if len(self._msgs) > _GROUP_CTX_MAX:
+            drop = len(self._msgs) - _GROUP_CTX_TRIM_TO
+            self._dropped += drop
+            self._msgs = self._msgs[drop:]
+
+    def get_context(self) -> str:
+        if not self._msgs:
+            return ""
+        lines: List[str] = []
+        if self._dropped:
+            lines.append(f"[... 省略 {self._dropped} 條較早的對話 ...]")
+        for m in self._msgs:
+            lines.append(f"{m.display_name}：{m.text}")
+        return "【近期群組對話】\n" + "\n".join(lines)
+
+    def clear(self) -> None:
+        self._msgs.clear()
+        self._dropped = 0
+
+    def to_dict(self) -> dict:
+        return {"dropped": self._dropped, "msgs": [{"ts": m.ts, "n": m.display_name, "t": m.text} for m in self._msgs]}
+
+    def from_dict(self, d: dict) -> None:
+        self._dropped = d.get("dropped", 0)
+        for item in d.get("msgs", []):
+            g = _GroupMsg(item["n"], item["t"])
+            g.ts = item.get("ts", 0.0)
+            self._msgs.append(g)
+
 
 # ---------------------------------------------------------------------------
 # Inbound dedup
@@ -523,6 +581,25 @@ class _LineClient:
                     raise RuntimeError(f"LINE push {resp.status}: {body[:200]}")
                 data = await resp.json()
                 return [m["id"] for m in data.get("sentMessages", []) if "id" in m]
+
+    async def mark_as_read(self, mark_as_read_token: str) -> None:
+        """Mark user message as read (shows double-tick). Best-effort."""
+        if not mark_as_read_token:
+            return
+        import aiohttp
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.post(
+                    "https://api.line.me/v2/bot/chat/markAsRead",
+                    headers=self._headers,
+                    json={"markAsReadToken": mark_as_read_token},
+                ) as resp:
+                    if resp.status not in (200, 204):
+                        body = await resp.text()
+                        logger.debug("LINE: markAsRead %s: %s", resp.status, body[:100])
+        except Exception as exc:
+            logger.debug("LINE: markAsRead failed: %s", exc)
 
     async def loading(self, chat_id: str, seconds: int = 60) -> None:
         """Loading indicator (DM only). LINE rejects this for groups/rooms."""
@@ -811,6 +888,14 @@ class LineAdapter(BasePlatformAdapter):
         # Pending-button slot per chat — ensures one outstanding postback
         # button per chat at a time. Postback cache request_id keyed by chat_id.
         self._pending_buttons: Dict[str, str] = {}
+        _ctx_store_path = os.path.join(
+            os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+            "line_group_ctx.json",
+        )
+        self._ctx_store_path = _ctx_store_path
+        self._group_context: Dict[str, _GroupContextBuffer] = {}
+        self._display_name_cache: Dict[str, Tuple[str, float]] = {}
+        self._load_group_context()
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -1006,6 +1091,55 @@ class LineAdapter(BasePlatformAdapter):
         else:
             logger.debug("LINE: ignoring event type %r", event_type)
 
+    def _load_group_context(self) -> None:
+        try:
+            import json as _j
+            with open(self._ctx_store_path) as _f:
+                raw = _j.load(_f)
+            for chat_id, d in raw.items():
+                buf = _GroupContextBuffer()
+                buf.from_dict(d)
+                self._group_context[chat_id] = buf
+        except Exception:
+            pass
+
+    def _flush_group_context(self) -> None:
+        try:
+            import json as _j, os as _os
+            data = {cid: buf.to_dict() for cid, buf in self._group_context.items()}
+            tmp = self._ctx_store_path + ".tmp"
+            with open(tmp, "w") as _f:
+                _j.dump(data, _f)
+            _os.replace(tmp, self._ctx_store_path)
+        except Exception:
+            pass
+
+    async def _get_display_name(self, user_id: str, chat_id: str, chat_type: str) -> str:
+        """Fetch LINE display name via API; caches for 1 hour."""
+        cached = self._display_name_cache.get(user_id)
+        if cached and cached[1] > time.time():
+            return cached[0]
+        try:
+            import aiohttp as _aiohttp
+            if chat_type == "group":
+                url = f"https://api.line.me/v2/bot/group/{chat_id}/member/{user_id}"
+            elif chat_type == "room":
+                url = f"https://api.line.me/v2/bot/room/{chat_id}/member/{user_id}"
+            else:
+                url = f"https://api.line.me/v2/bot/profile/{user_id}"
+            if self._client:
+                timeout = _aiohttp.ClientTimeout(total=5)
+                async with _aiohttp.ClientSession(timeout=timeout, trust_env=True) as sess:
+                    async with sess.get(url, headers=self._client._headers) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            name = data.get("displayName") or user_id
+                            self._display_name_cache[user_id] = (name, time.time() + _NAME_CACHE_TTL)
+                            return name
+        except Exception:
+            pass
+        return user_id
+
     async def _handle_message_event(self, event: Dict[str, Any]) -> None:
         msg = event.get("message") or {}
         msg_type = msg.get("type", "")
@@ -1014,6 +1148,14 @@ class LineAdapter(BasePlatformAdapter):
         source = event.get("source") or {}
         chat_id, chat_type = _resolve_chat(source)
         user_id = source.get("userId", "") or chat_id
+
+        # Clear group context buffer on /new or /reset
+        if chat_type == "group" and msg_type == "text":
+            _slash = (msg.get("text") or "").strip()
+            if _slash in {"/new", "/reset"}:
+                if chat_id in self._group_context:
+                    self._group_context[chat_id].clear()
+                    self._flush_group_context()
 
         # Require @mention in group chats when configured
         if self.require_mention and chat_type == "group":
@@ -1031,7 +1173,18 @@ class LineAdapter(BasePlatformAdapter):
                 if quoted_id and quoted_id in self._bot_message_ids:
                     is_mentioned = True
             if not is_mentioned:
+                if msg_type == "text":
+                    _raw = msg.get("text", "") or ""
+                    if _raw and user_id and self._client:
+                        _dname = await self._get_display_name(user_id, chat_id, chat_type)
+                        self._group_context.setdefault(chat_id, _GroupContextBuffer()).add(_dname, _raw)
+                        self._flush_group_context()
                 return
+
+        # Mark as read — DM only (groups never provide markAsReadToken)
+        _mar_token = event.get("markAsReadToken", "")
+        if _mar_token and chat_type == "dm" and self._client:
+            asyncio.create_task(self._client.mark_as_read(_mar_token))
 
         # Stash the reply token for outbound use.
         if chat_id and reply_token:
@@ -1054,6 +1207,13 @@ class LineAdapter(BasePlatformAdapter):
             quote_content = msg.get("quote", {}).get("content", "")
             if quote_content:
                 text = f"[引用訊息：{quote_content}]\n\n{text}"
+            if self.require_mention and chat_type == "group":
+                _buf = self._group_context.get(chat_id)
+                if _buf:
+                    _ctx = _buf.get_context()
+                    if _ctx:
+                        _sender = await self._get_display_name(user_id, chat_id, chat_type)
+                        text = f"{_ctx}\n\n【對你的訊息】\n{_sender}：{text}"
         elif msg_type in {"image", "audio", "video", "file"}:
             local_path = await self._download_media(message_id, msg_type)
             if local_path:
@@ -1121,6 +1281,8 @@ class LineAdapter(BasePlatformAdapter):
             payload = entry.payload or ""
             chunks = split_for_line(strip_markdown_preserving_urls(str(payload)))
             messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
+            if entry.quote_token and messages:
+                messages[0]["quoteToken"] = entry.quote_token
             try:
                 sent_ids = await self._client.reply(reply_token, messages)
                 self._bot_message_ids.add(sent_ids or [])
@@ -1149,9 +1311,13 @@ class LineAdapter(BasePlatformAdapter):
             except Exception:
                 pass
         elif entry.state is State.PENDING:
-            # Still working — re-issue the wait notice.
+            # LLM still running — resend the button with the same request_id
+            # so user can tap again when ready.
             try:
-                await self._client.reply(reply_token, [_text_message(self.pending_text)])
+                rebtn = build_postback_button_message(
+                    self.pending_text, self.button_label, request_id
+                )
+                await self._client.reply(reply_token, [rebtn])
             except Exception:
                 pass
 
@@ -1319,6 +1485,11 @@ class LineAdapter(BasePlatformAdapter):
             if chat_id in self._pending_buttons:
                 return
             rid = self._cache.register_pending(chat_id)
+            _qt = self._quote_tokens.get(chat_id, "")
+            if _qt:
+                _e = self._cache.get(rid)
+                if _e:
+                    _e.quote_token = _qt
             self._pending_buttons[chat_id] = rid
             token, used = self._consume_reply_token(chat_id)
             if not used:
