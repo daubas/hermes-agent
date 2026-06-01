@@ -1344,9 +1344,19 @@ class LineAdapter(BasePlatformAdapter):
 
         if msg_type == "text":
             text = msg.get("text", "") or ""
-            quote_content = msg.get("quote", {}).get("content", "")
+            quote_obj = msg.get("quote", {}) or {}
+            quote_content = quote_obj.get("content", "")
+            quoted_msg_id = msg.get("quotedMessageId", "") or quote_obj.get("messageId", "")
             if quote_content:
                 text = f"[引用訊息：{quote_content}]\n\n{text}"
+            elif quoted_msg_id:
+                # Empty quote content → quoted message is likely an image/media
+                quoted_path = await self._try_download_quoted_media(quoted_msg_id)
+                if quoted_path:
+                    media_urls.append(quoted_path)
+                    media_types.append("image")
+                else:
+                    text = f"[引用圖片：已失效，無法讀取]\n\n{text}"
             if self.require_mention and chat_type == "group":
                 _buf = self._group_context.get(chat_id)
                 if _buf:
@@ -1460,6 +1470,21 @@ class LineAdapter(BasePlatformAdapter):
                 await self._client.reply(reply_token, [rebtn])
             except Exception:
                 pass
+
+    async def _try_download_quoted_media(self, message_id: str) -> Optional[str]:
+        """Try to fetch a quoted message's media via Content API.
+
+        Returns a local cached path on success, None if the content has
+        expired or is unavailable (LINE purges media after a short window).
+        """
+        if not self._client or not message_id:
+            return None
+        try:
+            data = await self._client.fetch_content(message_id)
+            return cache_image_from_bytes(data, ext=".jpg")
+        except Exception as exc:
+            logger.info("LINE: quoted media %s unavailable: %s", message_id, exc)
+            return None
 
     async def _download_media(self, message_id: str, msg_type: str) -> Optional[str]:
         if not self._client or not message_id:
