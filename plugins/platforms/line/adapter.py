@@ -123,6 +123,21 @@ DEFAULT_WEBHOOK_PORT = 8646
 DEFAULT_WEBHOOK_PATH = "/line/webhook"
 DEFAULT_MEDIA_PATH_PREFIX = "/line/media"
 
+# Natural-language patterns for admin commands (home-chat only, case-insensitive)
+# Mirrors hermes's coerce_plaintext_gateway_command approach but for LINE admin ops.
+_ADMIN_SETHOME_RE = re.compile(
+    r"^(set\s*home|設為主頻道|設定主頻道|把這裡設為主頻道|把這個設為主頻道)$",
+    re.IGNORECASE,
+)
+_ADMIN_SAFEGUARD_ON_RE = re.compile(
+    r"^(safeguard\s*on|safe\s*mode\s*on|開啟安全模式|啟用安全模式|開安全模式|安全模式開啟)$",
+    re.IGNORECASE,
+)
+_ADMIN_SAFEGUARD_OFF_RE = re.compile(
+    r"^(safeguard\s*off|safe\s*mode\s*off|關閉安全模式|停用安全模式|關安全模式|安全模式關閉)$",
+    re.IGNORECASE,
+)
+
 # Slow-LLM postback button defaults
 DEFAULT_SLOW_RESPONSE_THRESHOLD = 45.0  # seconds; 0 disables
 DEFAULT_PENDING_REPLY_TEXT = (
@@ -1154,11 +1169,16 @@ class LineAdapter(BasePlatformAdapter):
         user_id: str,
         reply_token: str,
     ) -> bool:
-        """Handle admin-only slash commands. Returns True if the command was consumed."""
+        """Handle admin slash commands and natural-language equivalents.
+
+        Returns True if the command was consumed (caller should return early).
+        Mirrors hermes's coerce_plaintext_gateway_command pattern but scoped
+        to admin-user / home-chat access control.
+        """
         cmd = text.strip()
 
-        # /sethome — admin user only, works from any chat
-        if cmd == "/sethome":
+        # /sethome — slash or natural language, admin user only, any chat
+        if cmd == "/sethome" or _ADMIN_SETHOME_RE.match(cmd):
             if user_id != self._admin_user_id:
                 return True  # silently ignore non-admin
             self._save_home_chat(chat_id)
@@ -1171,11 +1191,11 @@ class LineAdapter(BasePlatformAdapter):
         if not self._home_chat_id or chat_id != self._home_chat_id:
             return False
 
-        if cmd in {"/safeguard", "/safeguard on"}:
+        if cmd in {"/safeguard", "/safeguard on"} or _ADMIN_SAFEGUARD_ON_RE.match(cmd):
             await self._set_safeguard(True, reply_token)
             return True
 
-        if cmd == "/safeguard off":
+        if cmd == "/safeguard off" or _ADMIN_SAFEGUARD_OFF_RE.match(cmd):
             await self._set_safeguard(False, reply_token)
             return True
 
@@ -1263,10 +1283,10 @@ class LineAdapter(BasePlatformAdapter):
         chat_id, chat_type = _resolve_chat(source)
         user_id = source.get("userId", "") or chat_id
 
-        # Admin slash commands — intercept before any group/mention logic
+        # Admin commands (slash or natural language) — intercept before group/mention logic
         if msg_type == "text":
             _cmd = (msg.get("text") or "").strip()
-            if _cmd.startswith("/") and await self._handle_admin_command(_cmd, chat_id, user_id, reply_token):
+            if _cmd and await self._handle_admin_command(_cmd, chat_id, user_id, reply_token):
                 return
 
         # Clear group context buffer on /new or /reset
