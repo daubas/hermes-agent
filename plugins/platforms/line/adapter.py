@@ -71,6 +71,7 @@ import mimetypes
 import os
 import re
 import secrets
+import subprocess
 import tempfile
 import time
 import uuid
@@ -777,8 +778,10 @@ def _truthy_env(name: str, default: bool = False) -> bool:
 class LineAdapter(BasePlatformAdapter):
     """LINE Messaging API gateway adapter."""
 
-    # LINE has its own message-edit story (none) — we always send fresh
-    # bubbles, never edit, so REQUIRES_EDIT_FINALIZE stays False.
+    # LINE does not support message editing — each update would fall back to
+    # a new Push message (paid quota). Tell the gateway to skip the stream
+    # consumer entirely so interim messages never trigger push sends.
+    SUPPORTS_MESSAGE_EDITING = False
 
     def __init__(self, config, **kwargs):
         platform = Platform("line")
@@ -896,6 +899,15 @@ class LineAdapter(BasePlatformAdapter):
         self._group_context: Dict[str, _GroupContextBuffer] = {}
         self._display_name_cache: Dict[str, Tuple[str, float]] = {}
         self._load_group_context()
+
+        # Admin / home-chat access control
+        self._admin_user_id: str = os.environ.get("LINE_ADMIN_USER_ID", "")
+        _home_store_path = os.path.join(
+            os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+            "line_home.json",
+        )
+        self._home_store_path = _home_store_path
+        self._home_chat_id: str = self._load_home_chat()
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -1114,6 +1126,103 @@ class LineAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # Admin / home-chat helpers
+    # ------------------------------------------------------------------
+
+    def _load_home_chat(self) -> str:
+        try:
+            with open(self._home_store_path) as _f:
+                return json.load(_f).get("home_chat_id", "")
+        except Exception:
+            return ""
+
+    def _save_home_chat(self, chat_id: str) -> None:
+        try:
+            tmp = self._home_store_path + ".tmp"
+            with open(tmp, "w") as _f:
+                json.dump({"home_chat_id": chat_id}, _f)
+            os.replace(tmp, self._home_store_path)
+            self._home_chat_id = chat_id
+        except Exception as e:
+            logger.warning("LINE: failed to save home chat: %s", e)
+
+    async def _handle_admin_command(
+        self,
+        text: str,
+        chat_id: str,
+        user_id: str,
+        reply_token: str,
+    ) -> bool:
+        """Handle admin-only slash commands. Returns True if the command was consumed."""
+        cmd = text.strip()
+
+        # /sethome — admin user only, works from any chat
+        if cmd == "/sethome":
+            if user_id != self._admin_user_id:
+                return True  # silently ignore non-admin
+            self._save_home_chat(chat_id)
+            if self._client and reply_token:
+                await self._client.reply(reply_token, [{"type": "text", "text": "✅ 主頻道已設定為此對話"}])
+            logger.info("LINE: home chat set to %s by admin %s", chat_id, user_id)
+            return True
+
+        # All commands below are gated to home chat only
+        if not self._home_chat_id or chat_id != self._home_chat_id:
+            return False
+
+        if cmd in {"/safeguard", "/safeguard on"}:
+            await self._set_safeguard(True, reply_token)
+            return True
+
+        if cmd == "/safeguard off":
+            await self._set_safeguard(False, reply_token)
+            return True
+
+        return False
+
+    async def _set_safeguard(self, enable: bool, reply_token: str) -> None:
+        """Toggle disabled_toolsets in config.yaml and restart the gateway service."""
+        hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+        config_path = os.path.join(hermes_home, "config.yaml")
+        try:
+            with open(config_path) as _f:
+                content = _f.read()
+
+            if enable:
+                content = content.replace(
+                    "  disabled_toolsets: []",
+                    "  disabled_toolsets: [terminal, browser]",
+                )
+                status_text = "🔒 安全模式已開啟（terminal、browser 工具停用）\n重啟中，稍候..."
+            else:
+                content = content.replace(
+                    "  disabled_toolsets: [terminal, browser]",
+                    "  disabled_toolsets: []",
+                )
+                status_text = "🔓 安全模式已關閉（所有工具恢復）\n重啟中，稍候..."
+
+            tmp = config_path + ".tmp"
+            with open(tmp, "w") as _f:
+                _f.write(content)
+            os.replace(tmp, config_path)
+
+            if self._client and reply_token:
+                await self._client.reply(reply_token, [{"type": "text", "text": status_text}])
+
+            # Restart non-blocking — service will be replaced; this process dies naturally
+            subprocess.Popen(
+                ["systemctl", "--user", "restart", "hermes-gateway"],
+                start_new_session=True,
+            )
+        except Exception as e:
+            logger.error("LINE: safeguard toggle failed: %s", e)
+            if self._client and reply_token:
+                try:
+                    await self._client.reply(reply_token, [{"type": "text", "text": f"❌ 操作失敗：{e}"}])
+                except Exception:
+                    pass
+
     async def _get_display_name(self, user_id: str, chat_id: str, chat_type: str) -> str:
         """Fetch LINE display name via API; caches for 1 hour."""
         cached = self._display_name_cache.get(user_id)
@@ -1148,6 +1257,12 @@ class LineAdapter(BasePlatformAdapter):
         source = event.get("source") or {}
         chat_id, chat_type = _resolve_chat(source)
         user_id = source.get("userId", "") or chat_id
+
+        # Admin slash commands — intercept before any group/mention logic
+        if msg_type == "text":
+            _cmd = (msg.get("text") or "").strip()
+            if _cmd.startswith("/") and await self._handle_admin_command(_cmd, chat_id, user_id, reply_token):
+                return
 
         # Clear group context buffer on /new or /reset
         if chat_type == "group" and msg_type == "text":
