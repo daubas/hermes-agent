@@ -1206,22 +1206,27 @@ class LineAdapter(BasePlatformAdapter):
             with open(tmp, "w") as _f:
                 _f.write(content)
             os.replace(tmp, config_path)
-
-            if self._client and reply_token:
-                await self._client.reply(reply_token, [{"type": "text", "text": status_text}])
-
-            # Restart non-blocking — service will be replaced; this process dies naturally
-            subprocess.Popen(
-                ["systemctl", "--user", "restart", "hermes-gateway"],
-                start_new_session=True,
-            )
         except Exception as e:
-            logger.error("LINE: safeguard toggle failed: %s", e)
+            logger.error("LINE: safeguard config write failed: %s", e)
             if self._client and reply_token:
                 try:
                     await self._client.reply(reply_token, [{"type": "text", "text": f"❌ 操作失敗：{e}"}])
                 except Exception:
                     pass
+            return
+
+        # Reply and restart are independent — reply failure must not stop restart
+        if self._client and reply_token:
+            try:
+                await self._client.reply(reply_token, [{"type": "text", "text": status_text}])
+            except Exception as e:
+                logger.warning("LINE: safeguard reply failed (will still restart): %s", e)
+
+        # Restart non-blocking — service will be replaced; this process dies naturally
+        subprocess.Popen(
+            ["systemctl", "--user", "restart", "hermes-gateway"],
+            start_new_session=True,
+        )
 
     async def _get_display_name(self, user_id: str, chat_id: str, chat_type: str) -> str:
         """Fetch LINE display name via API; caches for 1 hour."""
