@@ -10,6 +10,7 @@ surfacing a hard 401 — but ONLY for relogin-required failures, never for trans
 ones (e.g. 429 quota, where the stored token is still valid).
 """
 
+import base64
 import json
 
 import pytest
@@ -17,17 +18,38 @@ import pytest
 import hermes_cli.auth as auth
 from hermes_cli.auth import AuthError, _refresh_codex_auth_tokens, resolve_codex_runtime_credentials
 
-STALE = {"access_token": "stale-access", "refresh_token": "stale-refresh"}
+def _jwt(account_id: str) -> str:
+    payload = {
+        "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+        "exp": 4102444800,
+    }
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
+    return f"h.{encoded}.s"
 
 
-def test_self_heals_on_stale_refresh_token(monkeypatch):
+STALE = {"access_token": _jwt("account-a"), "refresh_token": "stale-refresh"}
+
+
+def _isolate_refresh_transaction(monkeypatch, tmp_path, saved):
+    owner_path = tmp_path / "owner-auth.json"
+    monkeypatch.setattr(auth, "_provider_auth_owner_path", lambda *a, **k: owner_path)
+    monkeypatch.setattr(auth, "_read_owned_codex_tokens", lambda *a, **k: None)
+    monkeypatch.setattr(
+        auth,
+        "_commit_owned_codex_tokens",
+        lambda _path, tokens, **_kwargs: saved.update(tokens),
+    )
+
+
+def test_self_heals_on_stale_refresh_token(tmp_path, monkeypatch):
     """invalid_grant (relogin-required) → reimport from ~/.codex and persist it."""
     saved = {}
     fresh = {
-        "access_token": "fresh-access",
+        "access_token": _jwt("account-a"),
         "refresh_token": "fresh-refresh",
         "last_refresh": "2026-06-12T00:00:00Z",
     }
+    _isolate_refresh_transaction(monkeypatch, tmp_path, saved)
 
     def _rejected(*_a, **_k):
         raise AuthError(
@@ -39,19 +61,19 @@ def test_self_heals_on_stale_refresh_token(monkeypatch):
 
     monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _rejected)
     monkeypatch.setattr(auth, "_import_codex_cli_tokens", lambda: dict(fresh))
-    monkeypatch.setattr(auth, "_save_codex_tokens", lambda t, *a, **k: saved.update(t))
 
     out = _refresh_codex_auth_tokens(STALE, 20.0)
 
-    assert out["access_token"] == "fresh-access"
+    assert out["access_token"] == _jwt("account-a")
     assert out["refresh_token"] == "fresh-refresh"
     # the recovered token was persisted to the Hermes auth store
-    assert saved["access_token"] == "fresh-access"
+    assert saved["access_token"] == _jwt("account-a")
 
 
-def test_does_not_self_heal_on_rate_limit(monkeypatch):
+def test_does_not_self_heal_on_rate_limit(tmp_path, monkeypatch):
     """429 quota keeps relogin_required=False — token still valid, must NOT reimport."""
     import_calls = {"n": 0}
+    _isolate_refresh_transaction(monkeypatch, tmp_path, {})
 
     def _rate_limited(*_a, **_k):
         raise AuthError(
@@ -76,8 +98,10 @@ def test_does_not_self_heal_on_rate_limit(monkeypatch):
     assert import_calls["n"] == 0  # never touched ~/.codex on a transient failure
 
 
-def test_reraises_when_codex_cli_token_absent(monkeypatch):
+def test_reraises_when_codex_cli_token_absent(tmp_path, monkeypatch):
     """relogin-required but ~/.codex unavailable/expired → propagate original error."""
+
+    _isolate_refresh_transaction(monkeypatch, tmp_path, {})
 
     def _reused(*_a, **_k):
         raise AuthError(
@@ -97,10 +121,11 @@ def test_reraises_when_codex_cli_token_absent(monkeypatch):
     assert ei.value.code == "refresh_token_reused"
 
 
-def test_happy_path_unchanged(monkeypatch):
+def test_happy_path_unchanged(tmp_path, monkeypatch):
     """Normal refresh succeeds → rotated tokens persisted, ~/.codex never consulted."""
     saved = {}
     import_calls = {"n": 0}
+    _isolate_refresh_transaction(monkeypatch, tmp_path, saved)
 
     def _import_spy():
         import_calls["n"] += 1
@@ -112,7 +137,6 @@ def test_happy_path_unchanged(monkeypatch):
         lambda *a, **k: {"access_token": "rotated", "refresh_token": "rotated-r"},
     )
     monkeypatch.setattr(auth, "_import_codex_cli_tokens", _import_spy)
-    monkeypatch.setattr(auth, "_save_codex_tokens", lambda t, *a, **k: saved.update(t))
 
     out = _refresh_codex_auth_tokens({"access_token": "a", "refresh_token": "b"}, 20.0)
 
@@ -122,10 +146,11 @@ def test_happy_path_unchanged(monkeypatch):
     assert import_calls["n"] == 0  # happy path must not consult ~/.codex
 
 
-def test_reraises_when_imported_token_lacks_refresh_token(monkeypatch):
+def test_reraises_when_imported_token_lacks_refresh_token(tmp_path, monkeypatch):
     """relogin-required, but ~/.codex returns an access_token with NO refresh_token →
     re-raise rather than persist a half-token that would break the next refresh."""
     saved = {}
+    _isolate_refresh_transaction(monkeypatch, tmp_path, saved)
 
     def _rejected(*_a, **_k):
         raise AuthError(
@@ -137,13 +162,62 @@ def test_reraises_when_imported_token_lacks_refresh_token(monkeypatch):
 
     monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _rejected)
     monkeypatch.setattr(auth, "_import_codex_cli_tokens", lambda: {"access_token": "fresh-only"})
-    monkeypatch.setattr(auth, "_save_codex_tokens", lambda t, *a, **k: saved.update(t))
 
     with pytest.raises(AuthError) as ei:
         _refresh_codex_auth_tokens(STALE, 20.0)
 
     assert ei.value.code == "invalid_grant"
     assert saved == {}  # nothing was persisted
+
+
+def test_refuses_codex_cli_token_from_different_account(tmp_path, monkeypatch):
+    """Terminal refresh errors must not silently switch the Hermes account."""
+    saved = {}
+    _isolate_refresh_transaction(monkeypatch, tmp_path, saved)
+
+    def _rejected(*_a, **_k):
+        raise AuthError(
+            "refresh token rejected",
+            provider="openai-codex",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", _rejected)
+    monkeypatch.setattr(
+        auth,
+        "_import_codex_cli_tokens",
+        lambda: {
+            "access_token": _jwt("account-b"),
+            "refresh_token": "account-b-refresh",
+        },
+    )
+
+    with pytest.raises(AuthError) as ei:
+        _refresh_codex_auth_tokens(STALE, 20.0)
+
+    assert ei.value.code == "invalid_grant"
+    assert saved == {}
+
+
+def test_provider_owner_is_global_store_for_profile_fallback(tmp_path, monkeypatch):
+    profile_path = tmp_path / "profiles" / "work" / "auth.json"
+    root_path = tmp_path / "root" / "auth.json"
+    profile_path.parent.mkdir(parents=True)
+    root_path.parent.mkdir(parents=True)
+    profile_path.write_text(json.dumps({"version": 1, "providers": {}}))
+    root_path.write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {"access_token": "root-a", "refresh_token": "root-r"}
+            }
+        },
+    }))
+    monkeypatch.setattr(auth, "_auth_file_path", lambda: profile_path)
+    monkeypatch.setattr(auth, "_global_auth_file_path", lambda: root_path)
+
+    assert auth._provider_auth_owner_path("openai-codex") == root_path
 
 
 def test_self_heals_missing_singleton_access_token_from_codex_cli(tmp_path, monkeypatch):

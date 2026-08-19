@@ -505,6 +505,15 @@ def _write_through_provider_state_to_global_root(
         )
 
 
+def _short_secret_fingerprint(value: Any) -> str:
+    """Return a safe identifier for correlating credential rotation in logs."""
+    if not value:
+        return "none"
+    import hashlib
+
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
+
+
 class CredentialPool:
     def __init__(self, provider: str, entries: List[PooledCredential]):
         self.provider = provider
@@ -949,6 +958,22 @@ class CredentialPool:
             return None
 
         try:
+            if self.provider == "openai-codex":
+                owner_path_obj = auth_mod._provider_auth_owner_path(
+                    self.provider,
+                    credential_id=entry.id,
+                    access_token=entry.access_token,
+                )
+            else:
+                owner_path_obj = auth_mod._auth_file_path()
+            owner_path = str(owner_path_obj)
+        except Exception:
+            owner_path_obj = None
+            owner_path = "unknown"
+        before_access_fp = _short_secret_fingerprint(entry.access_token)
+        before_refresh_fp = _short_secret_fingerprint(entry.refresh_token)
+
+        try:
             if self.provider == "anthropic":
                 from agent.anthropic_adapter import refresh_anthropic_oauth_pure
 
@@ -976,23 +1001,75 @@ class CredentialPool:
                     except Exception as wexc:
                         logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
             elif self.provider == "openai-codex":
-                # Adopt fresher tokens from auth.json before spending the
-                # refresh_token — single-use tokens consumed by another Hermes
-                # process sharing the same auth.json singleton would otherwise
-                # trigger ``refresh_token_reused`` on the next POST.
-                synced = self._sync_codex_entry_from_auth_store(entry)
-                if synced is not entry:
-                    entry = synced
-                refreshed = auth_mod.refresh_codex_oauth_pure(
-                    entry.access_token,
-                    entry.refresh_token,
+                # Hold the owner lock across reload, network rotation, and the
+                # atomic singleton+pool commit.  A second process therefore
+                # sees the newly rotated refresh_token before it can POST.
+                if owner_path_obj is None:
+                    owner_path_obj = auth_mod._auth_file_path()
+                    owner_path = str(owner_path_obj)
+                with auth_mod._auth_store_refresh_lock(owner_path_obj):
+                    owned_tokens = auth_mod._read_owned_codex_tokens(
+                        owner_path_obj,
+                        credential_id=entry.id,
+                    )
+                    if owned_tokens:
+                        entry = replace(
+                            entry,
+                            access_token=owned_tokens["access_token"],
+                            refresh_token=owned_tokens["refresh_token"],
+                            last_refresh=owned_tokens.get("last_refresh"),
+                        )
+                        before_access_fp = _short_secret_fingerprint(entry.access_token)
+                        before_refresh_fp = _short_secret_fingerprint(entry.refresh_token)
+                    else:
+                        synced = self._sync_codex_entry_from_auth_store(entry)
+                        if synced is not entry:
+                            entry = synced
+                            before_access_fp = _short_secret_fingerprint(entry.access_token)
+                            before_refresh_fp = _short_secret_fingerprint(entry.refresh_token)
+
+                    refreshed = auth_mod.refresh_codex_oauth_pure(
+                        entry.access_token,
+                        entry.refresh_token,
+                    )
+                    updated = replace(
+                        entry,
+                        access_token=refreshed["access_token"],
+                        refresh_token=refreshed["refresh_token"],
+                        last_refresh=refreshed.get("last_refresh"),
+                        last_status=STATUS_OK,
+                        last_status_at=None,
+                        last_error_code=None,
+                        last_error_reason=None,
+                        last_error_message=None,
+                        last_error_reset_at=None,
+                    )
+                    auth_mod._commit_owned_codex_tokens(
+                        owner_path_obj,
+                        {
+                            "access_token": updated.access_token,
+                            "refresh_token": updated.refresh_token,
+                        },
+                        last_refresh=updated.last_refresh,
+                        credential_id=entry.id,
+                        credential_source=entry.source,
+                        previous_access_token=entry.access_token,
+                    )
+
+                logger.info(
+                    "Credential refresh succeeded provider=%s credential_id=%s source=%s "
+                    "owner=%s access_fp=%s->%s refresh_fp=%s->%s",
+                    self.provider,
+                    entry.id,
+                    entry.source,
+                    owner_path,
+                    before_access_fp,
+                    _short_secret_fingerprint(updated.access_token),
+                    before_refresh_fp,
+                    _short_secret_fingerprint(updated.refresh_token),
                 )
-                updated = replace(
-                    entry,
-                    access_token=refreshed["access_token"],
-                    refresh_token=refreshed["refresh_token"],
-                    last_refresh=refreshed.get("last_refresh"),
-                )
+                self._replace_entry(entry, updated)
+                return updated
             elif self.provider == "xai-oauth":
                 # Adopt fresher tokens from auth.json before spending the
                 # refresh_token — single-use tokens consumed by another
@@ -1002,6 +1079,8 @@ class CredentialPool:
                 synced = self._sync_xai_oauth_entry_from_auth_store(entry)
                 if synced is not entry:
                     entry = synced
+                    before_access_fp = _short_secret_fingerprint(entry.access_token)
+                    before_refresh_fp = _short_secret_fingerprint(entry.refresh_token)
                 refreshed = auth_mod.refresh_xai_oauth_pure(
                     entry.access_token,
                     entry.refresh_token,
@@ -1023,7 +1102,20 @@ class CredentialPool:
             else:
                 return entry
         except Exception as exc:
-            logger.debug("Credential refresh failed for %s/%s: %s", self.provider, entry.id, exc)
+            logger.warning(
+                "Credential refresh failed provider=%s credential_id=%s source=%s "
+                "owner=%s access_fp=%s refresh_fp=%s error_type=%s error_code=%s "
+                "relogin_required=%s",
+                self.provider,
+                entry.id,
+                entry.source,
+                owner_path,
+                before_access_fp,
+                before_refresh_fp,
+                type(exc).__name__,
+                getattr(exc, "code", None) or "unknown",
+                bool(getattr(exc, "relogin_required", False)),
+            )
             # For anthropic claude_code entries: the refresh token may have been
             # consumed by another process. Check if ~/.claude/.credentials.json
             # has a newer token pair and retry once.
@@ -1272,6 +1364,18 @@ class CredentialPool:
             last_error_reason=None,
             last_error_message=None,
             last_error_reset_at=None,
+        )
+        logger.info(
+            "Credential refresh succeeded provider=%s credential_id=%s source=%s "
+            "owner=%s access_fp=%s->%s refresh_fp=%s->%s",
+            self.provider,
+            entry.id,
+            entry.source,
+            owner_path,
+            before_access_fp,
+            _short_secret_fingerprint(updated.access_token),
+            before_refresh_fp,
+            _short_secret_fingerprint(updated.refresh_token),
         )
         self._replace_entry(entry, updated)
         self._persist()

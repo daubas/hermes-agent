@@ -4109,6 +4109,63 @@ class SessionDB:
             )
             return cursor.fetchone() is not None
 
+    def find_platform_message(
+        self, source: str, platform_message_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return an active message by platform source and external ID."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT m.role, m.content, m.platform_message_id, m.observed, m.timestamp "
+                "FROM messages m JOIN sessions s ON s.id = m.session_id "
+                "WHERE s.source = ? AND m.platform_message_id = ? AND m.active = 1 "
+                "ORDER BY m.timestamp DESC, m.id DESC LIMIT 1",
+                (source, platform_message_id),
+            ).fetchone()
+            if row is None and source == "line":
+                row = self._conn.execute(
+                    "SELECT m.role, m.content, ? AS platform_message_id, "
+                    "m.observed, m.timestamp "
+                    "FROM messages m JOIN sessions s ON s.id = m.session_id "
+                    "WHERE s.source = ? AND m.role = 'user' AND m.active = 1 "
+                    "AND instr(COALESCE(m.content, ''), ?) > 0 "
+                    "ORDER BY m.timestamp DESC, m.id DESC LIMIT 1",
+                    (
+                        platform_message_id,
+                        source,
+                        f"source_event_id=line:message:{platform_message_id}]",
+                    ),
+                ).fetchone()
+        if row is None:
+            return None
+        content = self._decode_content(row["content"])
+        if row["role"] in {"user", "assistant"} and isinstance(content, str):
+            content = sanitize_context(content).strip()
+        return {
+            "role": row["role"],
+            "content": content,
+            "message_id": row["platform_message_id"],
+            "observed": bool(row["observed"]),
+            "timestamp": row["timestamp"],
+        }
+
+    def attach_platform_message_id(
+        self, session_id: str, platform_message_id: str, content: str
+    ) -> bool:
+        """Attach an inbound platform ID to its already-persisted user row."""
+        stored_content = self._encode_content(content)
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE messages SET platform_message_id = ? WHERE id = ("
+                "SELECT id FROM messages WHERE session_id = ? AND role = 'user' "
+                "AND platform_message_id IS NULL AND content = ? "
+                "ORDER BY id DESC LIMIT 1)",
+                (platform_message_id, session_id, stored_content),
+            )
+            return cursor.rowcount > 0
+
+        return bool(self._execute_write(_do))
+
     # =========================================================================
     # Export and cleanup
     # =========================================================================

@@ -33,6 +33,9 @@ verify_line_signature = _line.verify_line_signature
 strip_markdown_preserving_urls = _line.strip_markdown_preserving_urls
 split_for_line = _line.split_for_line
 build_postback_button_message = _line.build_postback_button_message
+build_workbench_handoff_message = _line.build_workbench_handoff_message
+build_workbench_ticket_message = _line.build_workbench_ticket_message
+needs_workbench_output = _line.needs_workbench_output
 _resolve_chat = _line._resolve_chat
 _allowed_for_source = _line._allowed_for_source
 _is_system_bypass = _line._is_system_bypass
@@ -45,6 +48,13 @@ validate_config = _line.validate_config
 _standalone_send = _line._standalone_send
 _env_enablement = _line._env_enablement
 _MessageDeduplicator = _line._MessageDeduplicator
+WORKBENCH_TICKET_RETURN_PREFIX = _line.WORKBENCH_TICKET_RETURN_PREFIX
+LineWorkbenchTicketTurn = _line.LineWorkbenchTicketTurn
+workbench_create_ticket = _line.workbench_create_ticket
+bind_line_ticket_turn_for_gateway = _line.bind_line_ticket_turn_for_gateway
+block_line_kanban_ticket_write = _line.block_line_kanban_ticket_write
+peek_line_ticket_card = _line.peek_line_ticket_card
+record_line_ticket_card = _line.record_line_ticket_card
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +305,13 @@ class TestMarkdownAndChunking:
         chunks = split_for_line(text)
         assert len(chunks) <= 5
 
+    def test_workbench_output_uses_only_strong_presentation_signals(self):
+        assert not needs_workbench_output("查詢完成：今天是 32 元。")
+        assert not needs_workbench_output("我用了工具，但答案很短。")
+        assert needs_workbench_output("| 方案 | 成本 |\n| --- | --- |\n| A | 100 |")
+        assert needs_workbench_output("```python\nprint('hello')\n```")
+        assert needs_workbench_output("長內容" * 1000)
+
 
 # ---------------------------------------------------------------------------
 # 7. Send routing (reply -> push fallback, batching, system-bypass)
@@ -303,13 +320,14 @@ class TestMarkdownAndChunking:
 class TestSendRouting:
 
     @pytest.fixture
-    def adapter(self, monkeypatch):
+    def adapter(self, monkeypatch, tmp_path):
         monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
         monkeypatch.delenv("LINE_CHANNEL_SECRET", raising=False)
         from gateway.config import PlatformConfig
         cfg = PlatformConfig(enabled=True, extra={
             "channel_access_token": "tok",
             "channel_secret": "sec",
+            "sent_message_ids_path": str(tmp_path / "sent-message-ids.json"),
         })
         ad = LineAdapter(cfg)
         ad._client = MagicMock()
@@ -334,6 +352,712 @@ class TestSendRouting:
         # Token consumed (single-use)
         assert "Uchat" not in adapter._reply_tokens
 
+    def test_send_records_line_message_id_for_future_quote(self, adapter):
+        import time as _time
+        adapter._reply_tokens["Cgroup"] = ("rt-token", _time.time() + 30)
+        adapter._client.reply.return_value = ["bot-message-1"]
+
+        result = asyncio.run(adapter.send("Cgroup", "hello"))
+
+        assert result.success
+        assert adapter._has_required_mention(
+            "follow up", {"quotedMessageId": "bot-message-1"}
+        )
+
+    def test_group_response_quotes_the_triggering_user_message(self, adapter):
+        import time as _time
+        adapter._reply_tokens["Cgroup"] = (
+            "rt-token",
+            _time.time() + 30,
+            "user-message-quote-token",
+        )
+
+        result = asyncio.run(adapter.send("Cgroup", "hello"))
+
+        assert result.success
+        messages = adapter._client.reply.call_args.args[1]
+        assert messages[0]["quoteToken"] == "user-message-quote-token"
+
+    def test_message_scoped_reply_token_survives_other_group_chatter(self, adapter):
+        import time as _time
+        adapter._reply_tokens["Cgroup"] = (
+            "newer-unrelated-token",
+            _time.time() + 30,
+            "newer-quote-token",
+        )
+        adapter._reply_contexts["trigger-message"] = (
+            "Cgroup",
+            "original-trigger-token",
+            _time.time() + 30,
+            "original-quote-token",
+        )
+
+        result = asyncio.run(
+            adapter.send("Cgroup", "answer", reply_to="trigger-message")
+        )
+
+        assert result.success
+        token, messages = adapter._client.reply.call_args.args
+        assert token == "original-trigger-token"
+        assert messages[0]["quoteToken"] == "original-quote-token"
+
+    def test_unmentioned_group_text_is_observed_without_dispatch(self, adapter):
+        adapter.require_mention = True
+        adapter.observe_unmentioned_group_messages = True
+        session_entry = MagicMock(session_id="shared-group-session")
+        adapter._session_store = MagicMock()
+        adapter._session_store.get_or_create_session.return_value = session_entry
+        adapter.handle_message = AsyncMock()
+        event = {
+            "replyToken": "ignored-reply-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Ualice"},
+            "message": {
+                "id": "message-1",
+                "type": "text",
+                "quoteToken": "ignored-quote-token",
+                "text": "Alice 的普通群組發言",
+            },
+        }
+
+        asyncio.run(adapter._handle_message_event(event))
+
+        adapter.handle_message.assert_not_awaited()
+        shared_source = adapter._session_store.get_or_create_session.call_args.args[0]
+        assert shared_source.chat_id == "Cgroup"
+        assert shared_source.user_id is None
+        observed = adapter._session_store.append_to_transcript.call_args.args[1]
+        assert observed["observed"] is True
+        assert "Ualice" in observed["content"]
+        assert "Alice 的普通群組發言" in observed["content"]
+        assert "Cgroup" not in adapter._reply_tokens
+
+    def test_unmentioned_bookkeeping_command_is_dispatched(self, adapter):
+        adapter.require_mention = True
+        adapter.observe_unmentioned_group_messages = True
+        adapter.handle_message = AsyncMock()
+
+        asyncio.run(adapter._handle_message_event({
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Ualice"},
+            "message": {"id": "message-1", "type": "text", "text": "記帳 午餐 125"},
+        }))
+
+        assert adapter.handle_message.await_args.args[0].text.endswith("記帳 午餐 125")
+
+    def test_bare_unmentioned_bookkeeping_word_stays_observed(self, adapter):
+        adapter.require_mention = True
+        adapter.observe_unmentioned_group_messages = True
+        adapter._session_store = MagicMock()
+        adapter._session_store.get_or_create_session.return_value = MagicMock(
+            session_id="shared-group-session"
+        )
+        adapter.handle_message = AsyncMock()
+
+        asyncio.run(adapter._handle_message_event({
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Ualice"},
+            "message": {"id": "message-1", "type": "text", "text": "記帳"},
+        }))
+
+        adapter.handle_message.assert_not_awaited()
+        adapter._session_store.append_to_transcript.assert_called_once()
+
+    def test_bare_bookkeeping_reply_is_dispatched_without_mention(self, adapter):
+        adapter.require_mention = True
+        adapter.observe_unmentioned_group_messages = True
+        adapter.handle_message = AsyncMock()
+
+        asyncio.run(adapter._handle_message_event({
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Ualice"},
+            "message": {
+                "id": "message-1",
+                "type": "text",
+                "quotedMessageId": "quoted-message",
+                "text": "記帳",
+            },
+        }))
+
+        assert adapter.handle_message.await_args.args[0].reply_to_message_id == "quoted-message"
+
+    def test_addressed_group_turn_uses_shared_observed_context_session(self, adapter):
+        adapter.require_mention = True
+        adapter.observe_unmentioned_group_messages = True
+        adapter.handle_message = AsyncMock()
+        mention_text = "@Methu"
+        event = {
+            "replyToken": "trigger-reply-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Ubob"},
+            "message": {
+                "id": "trigger-message",
+                "type": "text",
+                "quoteToken": "trigger-quote-token",
+                "quotedMessageId": "bot-message-1",
+                "text": f"{mention_text} 幫我整理大家剛才說的內容",
+                "mention": {
+                    "mentionees": [{
+                        "index": 0,
+                        "length": len(mention_text),
+                        "isSelf": True,
+                    }],
+                },
+            },
+        }
+        adapter._remember_sent_message_ids(["bot-message-1"])
+
+        asyncio.run(adapter._handle_message_event(event))
+
+        forwarded = adapter.handle_message.await_args.args[0]
+        assert forwarded.source.chat_id == "Cgroup"
+        assert forwarded.source.user_id is None
+        assert forwarded.source.role_authorized is True
+        assert forwarded.text.startswith(
+            "[Trusted LINE source: sender_id=Ubob; scope_id=Cgroup; "
+            "source_event_id=line:message:trigger-message]\n"
+        )
+        assert "observed LINE group context" in forwarded.channel_prompt
+        assert "first Trusted LINE source line" in forwarded.channel_prompt
+        assert forwarded.reply_to_message_id == "bot-message-1"
+        assert forwarded.reply_to_is_own_message is True
+        assert adapter._reply_contexts["trigger-message"][1] == "trigger-reply-token"
+
+        from gateway.run import GatewayRunner
+        runner = object.__new__(GatewayRunner)
+        assert runner._is_user_authorized(forwarded.source) is True
+        anonymous_source = adapter.build_source(
+            chat_id="Cgroup",
+            chat_type="group",
+            user_id=None,
+        )
+        assert runner._is_user_authorized(anonymous_source) is False
+
+    def test_group_reply_with_mention_includes_observed_message_text(self, adapter):
+        adapter.require_mention = True
+        adapter.observe_unmentioned_group_messages = True
+        adapter.handle_message = AsyncMock()
+        adapter._session_store = MagicMock()
+        adapter._session_store.get_or_create_session.return_value = MagicMock(
+            session_id="shared-group-session"
+        )
+        adapter._session_store.load_transcript.return_value = [{
+            "role": "user",
+            "content": "[Ualice|Ualice]\n午餐 $215",
+            "message_id": "quoted-message",
+            "observed": True,
+        }]
+        mention_text = "@Methu"
+        event = {
+            "replyToken": "trigger-reply-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Ubob"},
+            "message": {
+                "id": "trigger-message",
+                "type": "text",
+                "quotedMessageId": "quoted-message",
+                "text": mention_text,
+                "mention": {"mentionees": [{
+                    "index": 0,
+                    "length": len(mention_text),
+                    "isSelf": True,
+                }]},
+            },
+        }
+
+        asyncio.run(adapter._handle_message_event(event))
+
+        forwarded = adapter.handle_message.await_args.args[0]
+        assert forwarded.reply_to_message_id == "quoted-message"
+        assert forwarded.reply_to_text == (
+            "[Trusted quoted LINE source: sender_id=Ualice; "
+            "source_event_id=line:message:quoted-message]\n午餐 $215"
+        )
+
+    def test_group_reply_with_mention_attaches_observed_image(self, adapter, tmp_path):
+        adapter.require_mention = True
+        adapter.observe_unmentioned_group_messages = True
+        adapter.handle_message = AsyncMock()
+        adapter._session_store = MagicMock()
+        adapter._session_store.get_or_create_session.return_value = MagicMock(
+            session_id="shared-group-session"
+        )
+        adapter._session_store.load_transcript.return_value = [{
+            "role": "user",
+            "content": "[Ualice|Ualice]\n[image]",
+            "message_id": "quoted-image",
+            "observed": True,
+        }]
+        image_path = tmp_path / "receipt.jpg"
+        image_path.write_bytes(b"image")
+        adapter.workbench_media_log = str(tmp_path / "workbench-media.jsonl")
+        adapter._record_workbench_media(
+            chat_id="Cgroup",
+            chat_type="group",
+            user_id="Ualice",
+            message_id="quoted-image",
+            msg_type="image",
+            local_path=str(image_path),
+        )
+        mention_text = "@Methu"
+
+        asyncio.run(adapter._handle_message_event({
+            "replyToken": "trigger-reply-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Ubob"},
+            "message": {
+                "id": "trigger-message",
+                "type": "text",
+                "quotedMessageId": "quoted-image",
+                "text": mention_text,
+                "mention": {"mentionees": [{
+                    "index": 0,
+                    "length": len(mention_text),
+                    "isSelf": True,
+                }]},
+            },
+        }))
+
+        forwarded = adapter.handle_message.await_args.args[0]
+        assert forwarded.media_urls == [str(image_path)]
+        assert forwarded.media_types == ["image/jpeg"]
+
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+        from gateway.session import build_session_key
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(group_sessions_per_user=False)
+        runner.adapters = {}
+        runner._model = "test-model"
+        runner._base_url = None
+        runner._decide_image_input_mode = lambda: "native"
+        asyncio.run(runner._prepare_inbound_message_text(
+            event=forwarded,
+            source=forwarded.source,
+            history=[],
+        ))
+        assert runner._consume_pending_native_image_paths(
+            build_session_key(forwarded.source, group_sessions_per_user=False)
+        ) == [str(image_path)]
+
+    def test_group_reply_resolves_observed_message_after_session_reset(self, adapter, tmp_path):
+        from gateway.config import GatewayConfig
+        from gateway.session import SessionStore
+
+        store = SessionStore(tmp_path / "sessions", GatewayConfig())
+        source = adapter._group_observe_source("Cgroup", "group")
+        old_session = store.get_or_create_session(source)
+        store.append_to_transcript(old_session.session_id, {
+            "role": "user",
+            "content": "[Ualice|Ualice]\n午餐 $215",
+            "message_id": "quoted-message",
+            "observed": True,
+        })
+        store.reset_session(old_session.session_key)
+
+        adapter.require_mention = True
+        adapter.observe_unmentioned_group_messages = True
+        adapter.handle_message = AsyncMock()
+        adapter._session_store = store
+        mention_text = "@Methu"
+        asyncio.run(adapter._handle_message_event({
+            "replyToken": "trigger-reply-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Ubob"},
+            "message": {
+                "id": "trigger-message",
+                "type": "text",
+                "quotedMessageId": "quoted-message",
+                "text": mention_text,
+                "mention": {"mentionees": [{
+                    "index": 0,
+                    "length": len(mention_text),
+                    "isSelf": True,
+                }]},
+            },
+        }))
+
+        forwarded = adapter.handle_message.await_args.args[0]
+        assert forwarded.reply_to_text == (
+            "[Trusted quoted LINE source: sender_id=Ualice; "
+            "source_event_id=line:message:quoted-message]\n午餐 $215"
+        )
+
+    def test_group_reply_resolves_legacy_addressed_message_after_session_reset(
+        self, adapter, tmp_path
+    ):
+        from gateway.config import GatewayConfig
+        from gateway.session import SessionStore
+
+        store = SessionStore(tmp_path / "sessions", GatewayConfig())
+        source = adapter._group_observe_source("Cgroup", "group")
+        old_session = store.get_or_create_session(source)
+        store.append_to_transcript(old_session.session_id, {
+            "role": "user",
+            "content": (
+                "[Trusted LINE source: sender_id=Ualice; scope_id=Cgroup; "
+                "source_event_id=line:message:quoted-message]\n午餐 $215"
+            ),
+        })
+        store.reset_session(old_session.session_key)
+
+        adapter.require_mention = True
+        adapter.observe_unmentioned_group_messages = True
+        adapter.handle_message = AsyncMock()
+        adapter._session_store = store
+        mention_text = "@Methu"
+        asyncio.run(adapter._handle_message_event({
+            "replyToken": "trigger-reply-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Ubob"},
+            "message": {
+                "id": "trigger-message",
+                "type": "text",
+                "quotedMessageId": "quoted-message",
+                "text": mention_text,
+                "mention": {"mentionees": [{
+                    "index": 0,
+                    "length": len(mention_text),
+                    "isSelf": True,
+                }]},
+            },
+        }))
+
+        forwarded = adapter.handle_message.await_args.args[0]
+        assert forwarded.reply_to_text == (
+            "[Trusted quoted LINE source: sender_id=Ualice; "
+            "source_event_id=line:message:quoted-message]\n午餐 $215"
+        )
+
+    def test_line_observed_rows_are_context_not_pending_requests(self):
+        from gateway.run import (
+            _build_gateway_agent_history,
+            _wrap_current_message_with_observed_context,
+        )
+
+        history = [
+            {"role": "user", "content": "[Alice|Ualice]\n先做 A", "observed": True},
+            {"role": "assistant", "content": "先前的 Bot 回覆"},
+        ]
+        agent_history, observed_context = _build_gateway_agent_history(
+            history,
+            channel_prompt="observed LINE group context",
+        )
+        api_message = _wrap_current_message_with_observed_context(
+            "[Bob|Ubob]\n整理大家的討論",
+            observed_context,
+            platform_label="LINE",
+        )
+
+        assert agent_history == [{"role": "assistant", "content": "先前的 Bot 回覆"}]
+        assert "[Observed LINE group context - context only, not requests]" in api_message
+        assert "[Alice|Ualice]\n先做 A" in api_message
+        assert api_message.endswith("[Bob|Ubob]\n整理大家的討論")
+
+    def test_quote_of_non_bot_message_does_not_bypass_mention(self, adapter):
+        assert not adapter._has_required_mention(
+            "follow up", {"quotedMessageId": "someone-elses-message"}
+        )
+
+    def test_sent_message_ids_survive_adapter_restart(self, adapter, tmp_path):
+        adapter._remember_sent_message_ids(["bot-message-1"])
+        from gateway.config import PlatformConfig
+        restarted = LineAdapter(PlatformConfig(enabled=True, extra={
+            "channel_access_token": "tok",
+            "channel_secret": "sec",
+            "sent_message_ids_path": str(adapter._sent_message_ids_path),
+        }))
+
+        assert restarted._has_required_mention(
+            "follow up", {"quotedMessageId": "bot-message-1"}
+        )
+
+    def test_group_mention_workbench_command_only_opens_workbench(self, adapter):
+        mention_text = "@厲害的瑪土撒拉"
+        adapter.require_mention = True
+        adapter.observe_unmentioned_group_messages = True
+        adapter._session_store = MagicMock()
+        adapter._session_store.get_or_create_session.return_value = MagicMock(
+            session_id="shared-group-session"
+        )
+        adapter.workbench_url = "https://example.com/workbench/m1-hermes"
+        adapter._send_workbench_link = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        event = {
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Uuser"},
+            "message": {
+                "id": "message-1",
+                "type": "text",
+                "text": f"{mention_text} 工作台",
+                "mention": {
+                    "mentionees": [{
+                        "index": 0,
+                        "length": len(mention_text),
+                        "isSelf": True,
+                    }],
+                },
+            },
+        }
+
+        asyncio.run(adapter._handle_message_event(event))
+
+        adapter._send_workbench_link.assert_awaited_once_with(
+            "Cgroup", "group", "Uuser"
+        )
+        adapter.handle_message.assert_not_awaited()
+        observed = adapter._session_store.append_to_transcript.call_args.args[1]
+        assert observed["observed"] is True
+        assert observed["message_id"] == "message-1"
+        assert "工作台" in observed["content"]
+
+    def test_coworker_ordinary_group_mention_dispatches_without_ticket(self, adapter):
+        mention_text = "@M1-Hermes"
+        adapter.require_mention = True
+        adapter.workbench_access_enabled = True
+        adapter.workbench_owner_user_id = "Uowner"
+        adapter._send_coworker_request = AsyncMock(return_value=True)
+        adapter.handle_message = AsyncMock()
+        event = {
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Ucoworker"},
+            "message": {
+                "id": "message-1",
+                "type": "text",
+                "text": f"{mention_text} 午餐$135",
+                "mention": {
+                    "mentionees": [{
+                        "index": 0,
+                        "length": len(mention_text),
+                        "isSelf": True,
+                    }],
+                },
+            },
+        }
+
+        asyncio.run(adapter._handle_message_event(event))
+
+        adapter.handle_message.assert_awaited_once()
+        assert adapter.handle_message.await_args.args[0].text.endswith("午餐$135")
+        adapter._send_coworker_request.assert_not_awaited()
+
+    def test_coworker_explicit_workbench_request_creates_ticket_without_dispatch(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
+        monkeypatch.delenv("LINE_CHANNEL_SECRET", raising=False)
+        policy_path = tmp_path / "workbench-access.json"
+        policy_path.write_text(
+            json.dumps({"version": 1, "owner_user_id": "Uowner"}),
+            encoding="utf-8",
+        )
+        from gateway.config import PlatformConfig
+        adapter = LineAdapter(PlatformConfig(enabled=True, extra={
+            "channel_access_token": "tok",
+            "channel_secret": "sec",
+            "push_enabled": False,
+            "require_mention": True,
+            "allowed_groups": ["Cgroup"],
+            "workbench_url": "https://example.com/workbench/m1-hermes",
+            "workbench_agent_id": "m1-hermes",
+            "workbench_profile": "__default__",
+            "workbench_access_policy": str(policy_path),
+            "workbench_internal_url": "http://127.0.0.1:8650",
+            "workbench_internal_token": "ticket-test-token",
+            "sent_message_ids_path": str(tmp_path / "sent-message-ids.json"),
+        }))
+        adapter._client = MagicMock()
+        adapter._client.reply = AsyncMock(return_value=[])
+        adapter._client.push = AsyncMock()
+        adapter.observe_unmentioned_group_messages = True
+        adapter._session_store = MagicMock()
+        adapter._session_store.get_or_create_session.return_value = MagicMock(
+            session_id="shared-group-session"
+        )
+        captured_turns = []
+
+        async def capture_turn(event):
+            captured_turns.append((event, _line._line_workbench_ticket_turn.get()))
+
+        adapter.handle_message = AsyncMock(side_effect=capture_turn)
+        adapter._create_workbench_ticket = AsyncMock(return_value={
+            "id": "0123456789abcdef0123456789abcdef",
+        })
+        mention_text = "@Methu"
+
+        event = {
+            "type": "message",
+            "webhookEventId": "coworker-event",
+            "replyToken": "coworker-reply-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Ucoworker"},
+            "message": {
+                "id": "coworker-message",
+                "type": "text",
+                "quoteToken": "coworker-quote-token",
+                "text": f"{mention_text} 工作臺 幫我整理這一週的工作",
+                "mention": {
+                    "mentionees": [{
+                        "index": 0,
+                        "length": len(mention_text),
+                        "isSelf": True,
+                    }],
+                },
+            },
+        }
+
+        asyncio.run(adapter._dispatch_event(event))
+
+        adapter.handle_message.assert_not_awaited()
+        observed = adapter._session_store.append_to_transcript.call_args.args[1]
+        assert observed["observed"] is True
+        assert observed["message_id"] == "coworker-message"
+        assert "工作臺 幫我整理這一週的工作" in observed["content"]
+        adapter._client.push.assert_not_called()
+        adapter._create_workbench_ticket.assert_awaited_once_with(
+            chat_id="Cgroup",
+            chat_type="group",
+            user_id="Ucoworker",
+            input_text="工作臺 幫我整理這一週的工作",
+            source_message_id="coworker-message",
+            quote_token="coworker-quote-token",
+            media_ids=None,
+        )
+
+        token, messages = adapter._client.reply.await_args.args
+        assert token == "coworker-reply-token"
+        uri = messages[0]["template"]["actions"][0]["uri"]
+        assert uri.endswith("/ticket/0123456789abcdef0123456789abcdef")
+        assert json.loads(messages[0]["template"]["actions"][1]["data"]) == {
+            "action": "ticket_status",
+            "ticket_id": "0123456789abcdef0123456789abcdef",
+        }
+
+        owner_event = {
+            "type": "message",
+            "webhookEventId": "owner-event",
+            "replyToken": "owner-reply-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Uowner"},
+            "message": {
+                "id": "owner-message",
+                "type": "text",
+                "text": f"{mention_text} 直接處理這件事",
+                "mention": {
+                    "mentionees": [{
+                        "index": 0,
+                        "length": len(mention_text),
+                        "isSelf": True,
+                    }],
+                },
+            },
+        }
+        asyncio.run(adapter._dispatch_event(owner_event))
+
+        adapter.handle_message.assert_awaited_once()
+        forwarded, turn = captured_turns[0]
+        assert forwarded._line_workbench_ticket_turn == turn
+        assert turn.user_id == "Uowner"
+        assert turn.chat_id == "Cgroup"
+        assert turn.source_message_id == "owner-message"
+
+    def test_text_alias_is_removed_before_workbench_command_matching(self, adapter):
+        adapter.mention_aliases = {"methu"}
+        assert adapter._workbench_command_text(
+            "@Methu 工作臺", {"type": "text"}
+        ) == "工作臺"
+
+    def test_ticket_return_bypasses_group_mention_gate(self, adapter):
+        adapter.require_mention = True
+        adapter._handle_ticket_return_command = AsyncMock()
+        ticket_id = "0123456789abcdef0123456789abcdef"
+        event = {
+            "type": "message",
+            "webhookEventId": "ticket-return-event",
+            "replyToken": "ticket-return-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Ucoworker"},
+            "message": {
+                "id": "ticket-return-message",
+                "type": "text",
+                "text": f"{WORKBENCH_TICKET_RETURN_PREFIX}{ticket_id}",
+            },
+        }
+
+        asyncio.run(adapter._handle_message_event(event))
+
+        adapter._handle_ticket_return_command.assert_awaited_once_with(
+            ticket_id=ticket_id,
+            chat_id="Cgroup",
+            chat_type="group",
+            reply_token="ticket-return-token",
+            webhook_event_id="ticket-return-event",
+        )
+
+    def test_ticket_return_replies_once_and_records_delivery(self, adapter):
+        adapter._claim_ticket_return = AsyncMock(return_value={
+            "lifecycle": "resolved",
+            "public_summary": "整理本週工作",
+            "published_response": "# 結果\n\n已完成。",
+            "quote_token": "origin-quote-token",
+            "return_state": "claimed",
+        })
+        adapter._mark_ticket_return_delivered = AsyncMock()
+        adapter._client.reply = AsyncMock(return_value=[])
+        ticket_id = "0123456789abcdef0123456789abcdef"
+
+        asyncio.run(adapter._handle_ticket_return_command(
+            ticket_id=ticket_id,
+            chat_id="Cgroup",
+            chat_type="group",
+            reply_token="fresh-reply-token",
+            webhook_event_id="ticket-return-event",
+        ))
+
+        token, messages = adapter._client.reply.await_args.args
+        assert token == "fresh-reply-token"
+        assert messages[0]["quoteToken"] == "origin-quote-token"
+        assert "結果" in messages[0]["text"]
+        adapter._mark_ticket_return_delivered.assert_awaited_once_with(
+            ticket_id,
+            chat_id="Cgroup",
+            chat_type="group",
+            webhook_event_id="ticket-return-event",
+        )
+
+    def test_ticket_return_does_not_reply_to_the_same_webhook_twice(self, adapter):
+        adapter._claim_ticket_return = AsyncMock(return_value={"return_state": "duplicate"})
+        ticket_id = "0123456789abcdef0123456789abcdef"
+
+        asyncio.run(adapter._handle_ticket_return_command(
+            ticket_id=ticket_id,
+            chat_id="Cgroup",
+            chat_type="group",
+            reply_token="fresh-reply-token",
+            webhook_event_id="ticket-return-event",
+        ))
+
+        adapter._client.reply.assert_not_called()
+
+    def test_ticket_status_postback_reads_current_origin_state(self, adapter):
+        adapter._ticket_status = AsyncMock(return_value={
+            "lifecycle": "pending",
+            "public_summary": "整理本週工作",
+        })
+        adapter._client.reply = AsyncMock(return_value=[])
+
+        asyncio.run(adapter._handle_postback_event({
+            "replyToken": "status-reply-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Ucoworker"},
+            "postback": {
+                "data": json.dumps({
+                    "action": "ticket_status",
+                    "ticket_id": "0123456789abcdef0123456789abcdef",
+                }),
+            },
+        }))
+
+        adapter._ticket_status.assert_awaited_once_with(
+            "0123456789abcdef0123456789abcdef",
+            chat_id="Cgroup",
+            chat_type="group",
+        )
+        token, messages = adapter._client.reply.await_args.args
+        assert token == "status-reply-token"
+        assert "等待負責人核准" in messages[0]["text"]
+
     def test_send_falls_back_to_push_when_no_token(self, adapter):
         result = asyncio.run(adapter.send("Uchat", "hello"))
         assert result.success
@@ -348,6 +1072,51 @@ class TestSendRouting:
         assert result.success
         adapter._client.reply.assert_called_once()
         adapter._client.push.assert_called_once()
+
+    def test_push_disabled_never_sends_without_reply_token(self, adapter):
+        adapter.push_enabled = False
+        result = asyncio.run(adapter.send("Uchat", "hello"))
+        assert not result.success
+        assert result.error == "LINE Push API is disabled"
+        adapter._client.reply.assert_not_called()
+        adapter._client.push.assert_not_called()
+
+    def test_push_disabled_never_falls_back_after_reply_failure(self, adapter):
+        import time as _time
+        adapter.push_enabled = False
+        adapter._reply_tokens["Uchat"] = ("rt-token", _time.time() + 30)
+        adapter._client.reply.side_effect = RuntimeError("expired")
+        result = asyncio.run(adapter.send("Uchat", "hello"))
+        assert not result.success
+        assert result.error == "LINE reply failed and Push API is disabled"
+        adapter._client.reply.assert_called_once()
+        adapter._client.push.assert_not_called()
+
+    def test_push_disabled_blocks_prebuilt_media_messages(self, adapter):
+        adapter.push_enabled = False
+        result = asyncio.run(adapter._send_messages("Uchat", [{"type": "image"}]))
+        assert not result.success
+        assert result.error == "LINE Push API is disabled"
+        adapter._client.push.assert_not_called()
+
+    def test_push_disabled_blocks_postback_reply_fallback(self, adapter):
+        adapter.push_enabled = False
+        request_id = adapter._cache.register_pending("Uchat")
+        adapter._cache.set_ready(request_id, "done")
+        adapter._client.reply.side_effect = RuntimeError("expired")
+        asyncio.run(adapter._handle_postback_event({
+            "replyToken": "fresh-token",
+            "source": {"type": "user", "userId": "Uchat"},
+            "postback": {
+                "data": json.dumps({
+                    "action": "show_response",
+                    "request_id": request_id,
+                }),
+            },
+        }))
+        adapter._client.reply.assert_called_once()
+        adapter._client.push.assert_not_called()
+        assert adapter._cache.get(request_id).state is State.READY
 
     def test_send_returns_failure_when_push_fails(self, adapter):
         adapter._client.push.side_effect = RuntimeError("network")
@@ -366,6 +1135,65 @@ class TestSendRouting:
         adapter._client.push.assert_not_called()
         assert adapter._cache.get(rid).state is State.READY
         assert adapter._cache.get(rid).payload == "the answer"
+        assert "Uchat" not in adapter._pending_buttons
+
+    def test_next_turn_replies_in_line_after_handoff_becomes_ready(self, adapter):
+        import time as _time
+        rid = adapter._cache.register_pending("Uchat")
+        adapter._pending_buttons["Uchat"] = rid
+        asyncio.run(adapter.send("Uchat", "the handoff answer"))
+        adapter._client.reply.reset_mock()
+        adapter._reply_tokens["Uchat"] = ("next-reply-token", _time.time() + 30)
+
+        result = asyncio.run(adapter.send("Uchat", "the next answer"))
+
+        assert result.success
+        adapter._client.reply.assert_called_once()
+        assert adapter._cache.get(rid).payload == "the handoff answer"
+
+    def test_workbench_first_creates_pending_handoff_immediately(self, adapter, tmp_path):
+        import time as _time
+        adapter.workbench_url = "https://example.com/workbench/m1-hermes"
+        adapter.workbench_agent_id = "m1-hermes"
+        adapter.workbench_profile = "__default__"
+        adapter.workbench_handoff_dir = str(tmp_path)
+        adapter._reply_tokens["Uchat"] = ("rt-token", _time.time() + 30)
+
+        opened = asyncio.run(
+            adapter._begin_workbench_handoff("Uchat", "dm", "Uchat", "整理 A 專案")
+        )
+
+        assert opened
+        adapter._client.reply.assert_called_once()
+        message = adapter._client.reply.call_args.args[1][0]
+        assert [action["type"] for action in message["template"]["actions"]] == ["uri", "postback"]
+        rid = adapter._pending_buttons["Uchat"]
+        record = json.loads((tmp_path / f"{rid}.json").read_text())
+        assert record["agent_id"] == "m1-hermes"
+        assert record["profile"] == "__default__"
+        assert record["status"] == "pending"
+        assert record["input"] == "整理 A 專案"
+
+    def test_structured_fast_answer_uses_ready_workbench_handoff(self, adapter, tmp_path):
+        import time as _time
+        adapter.workbench_url = "https://example.com/workbench/m1-hermes"
+        adapter.workbench_handoff_dir = str(tmp_path)
+        adapter._workbench_inputs["Uchat"] = "比較方案"
+        adapter._workbench_sources["Uchat"] = ("dm", "Uchat")
+        adapter._reply_tokens["Uchat"] = ("rt-token", _time.time() + 30)
+        table = "| 方案 | 成本 |\n| --- | --- |\n| A | 100 |"
+
+        result = asyncio.run(adapter.send("Uchat", table))
+
+        assert result.success
+        adapter._client.reply.assert_called_once()
+        adapter._client.push.assert_not_called()
+        rid = result.message_id
+        assert adapter._cache.get(rid).state is State.READY
+        assert "Uchat" not in adapter._pending_buttons
+        record = json.loads((tmp_path / f"{rid}.json").read_text())
+        assert record["status"] == "ready"
+        assert record["output"] == table
 
     def test_send_system_bypass_skips_postback_cache(self, adapter):
         # Even with a pending button, system busy-acks must surface visibly.
@@ -398,6 +1226,134 @@ class TestSendRouting:
         assert "**" not in out
         assert "https://x.com" in out
 
+    def test_ticket_card_replaces_the_model_final_text(self, adapter):
+        import time as _time
+
+        adapter.workbench_url = "https://example.com/workbench/m1-hermes"
+        adapter.workbench_agent_id = "m1-hermes"
+        adapter._reply_contexts["line-message-1"] = (
+            "Cgroup", "reply-token", _time.time() + 30, "quote-token",
+        )
+        turn = LineWorkbenchTicketTurn(
+            agent_id="m1-hermes",
+            profile="__default__",
+            chat_id="Cgroup",
+            chat_type="group",
+            user_id="Uowner",
+            source_message_id="line-message-1",
+            quote_token="quote-token",
+            media_ids=(),
+            internal_url="http://127.0.0.1:8650",
+            internal_token="ticket-secret",
+        )
+        record_line_ticket_card(
+            turn,
+            ticket_id="0123456789abcdef0123456789abcdef",
+            public_summary="整理禮金與出席名單",
+        )
+
+        result = asyncio.run(
+            adapter.send("Cgroup", "模型最後的文字不應取代 Ticket 卡片", reply_to="line-message-1")
+        )
+
+        assert result.success
+        message = adapter._client.reply.await_args.args[1][0]
+        assert message["template"]["actions"][0]["label"] == "開啟 Ticket"
+        assert "整理禮金與出席名單" in message["template"]["text"]
+        assert peek_line_ticket_card("m1-hermes", "Cgroup", "line-message-1") is None
+
+
+class TestWorkbenchTicketTool:
+
+    @staticmethod
+    def _turn():
+        return LineWorkbenchTicketTurn(
+            agent_id="m1-hermes",
+            profile="__default__",
+            chat_id="Cgroup",
+            chat_type="group",
+            user_id="Uowner",
+            source_message_id="line-message-2",
+            quote_token="quote-token",
+            media_ids=("image-message-1",),
+            internal_url="http://127.0.0.1:8650",
+            internal_token="ticket-secret",
+        )
+
+    def test_tool_uses_trusted_line_turn_not_model_supplied_identity(self, monkeypatch):
+        captured = {}
+
+        def fake_post(turn, body):
+            captured["turn"] = turn
+            captured["body"] = body
+            return {
+                "id": "0123456789abcdef0123456789abcdef",
+                "lifecycle": "pending",
+                "public_summary": body["public_summary"],
+            }
+
+        monkeypatch.setattr(_line, "post_workbench_ticket", fake_post)
+        turn = self._turn()
+        token = _line._line_workbench_ticket_turn.set(turn)
+        try:
+            result = json.loads(workbench_create_ticket({
+                "public_summary": "整理群組目前的禮金工作",
+                "work_context": "私人脈絡：已確認的出席與禮金資料。",
+                "user_id": "Uforged",
+            }))
+        finally:
+            _line._line_workbench_ticket_turn.reset(token)
+
+        assert result == {
+            "ticket_id": "0123456789abcdef0123456789abcdef",
+            "lifecycle": "pending",
+            "public_summary": "整理群組目前的禮金工作",
+        }
+        assert captured["turn"] == turn
+        assert captured["body"]["user_id"] == "Uowner"
+        assert captured["body"]["input"] == "私人脈絡：已確認的出席與禮金資料。"
+        assert captured["body"]["media_ids"] == ["image-message-1"]
+        assert captured["body"]["client_request_id"]
+
+    def test_tool_requires_a_trusted_line_turn(self):
+        token = _line._line_workbench_ticket_turn.set(None)
+        try:
+            result = json.loads(workbench_create_ticket({
+                "public_summary": "整理工作",
+                "work_context": "工作內容",
+            }))
+        finally:
+            _line._line_workbench_ticket_turn.reset(token)
+
+        assert result == {"error": "workbench_ticket_unavailable"}
+
+    def test_gateway_hook_rebinds_ticket_turn_for_queued_events(self):
+        turn = self._turn()
+        event = type("Event", (), {"_line_workbench_ticket_turn": turn})()
+        bind_line_ticket_turn_for_gateway(event=event)
+        assert _line._line_workbench_ticket_turn.get() == turn
+
+        bind_line_ticket_turn_for_gateway(event=object())
+        assert _line._line_workbench_ticket_turn.get() is None
+
+    def test_group_ticket_turn_blocks_hermes_kanban_writes(self):
+        token = _line._line_workbench_ticket_turn.set(self._turn())
+        try:
+            assert block_line_kanban_ticket_write(
+                tool_name="terminal",
+                args={"command": "hermes kanban create --title '整理禮金'"},
+            )["action"] == "block"
+            assert block_line_kanban_ticket_write(
+                tool_name="skill_view",
+                args={"name": "kanban-orchestrator"},
+            )["action"] == "block"
+            assert block_line_kanban_ticket_write(
+                tool_name="terminal",
+                args={"command": "hermes kanban show t_123"},
+            ) is None
+        finally:
+            _line._line_workbench_ticket_turn.reset(token)
+
 
 # ---------------------------------------------------------------------------
 # 8. Register() metadata + plugin entry points
@@ -408,9 +1364,17 @@ class TestRegister:
     class _FakeCtx:
         def __init__(self):
             self.kwargs = None
+            self.tools = []
+            self.hooks = []
 
         def register_platform(self, **kw):
             self.kwargs = kw
+
+        def register_tool(self, **kw):
+            self.tools.append(kw)
+
+        def register_hook(self, name, callback):
+            self.hooks.append((name, callback))
 
     def test_register_calls_register_platform(self):
         ctx = self._FakeCtx()
@@ -418,6 +1382,16 @@ class TestRegister:
         assert ctx.kwargs is not None
         assert ctx.kwargs["name"] == "line"
         assert ctx.kwargs["label"] == "LINE"
+
+    def test_register_adds_the_line_ticket_tool_and_policy_hooks(self):
+        ctx = self._FakeCtx()
+        register(ctx)
+        assert [(item["name"], item["toolset"]) for item in ctx.tools] == [
+            ("workbench_create_ticket", "line"),
+        ]
+        assert {name for name, _callback in ctx.hooks} == {
+            "pre_gateway_dispatch", "pre_tool_call",
+        }
 
     def test_register_advertises_required_env(self):
         ctx = self._FakeCtx()
@@ -474,11 +1448,17 @@ class TestEnvEnablement:
         assert _env_enablement() is None
 
     def test_returns_dict_with_credentials(self, monkeypatch):
+        monkeypatch.delenv("LINE_CHANNEL_ENV_FILE", raising=False)
+        for key in ("LINE_PORT", "LINE_HOST", "LINE_PUBLIC_URL", "LINE_HOME_CHANNEL"):
+            monkeypatch.delenv(key, raising=False)
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "tok")
         monkeypatch.setenv("LINE_CHANNEL_SECRET", "sec")
         assert _env_enablement() == {}
 
     def test_seeds_port_from_env(self, monkeypatch):
+        monkeypatch.delenv("LINE_CHANNEL_ENV_FILE", raising=False)
+        for key in ("LINE_HOST", "LINE_PUBLIC_URL", "LINE_HOME_CHANNEL"):
+            monkeypatch.delenv(key, raising=False)
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "tok")
         monkeypatch.setenv("LINE_CHANNEL_SECRET", "sec")
         monkeypatch.setenv("LINE_PORT", "8080")
@@ -532,6 +1512,14 @@ class TestStandaloneSend:
         # Message wraps as text bubble
         assert push_calls[0][1][0]["type"] == "text"
 
+    def test_push_disabled_blocks_standalone_send(self, monkeypatch):
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "tok")
+        monkeypatch.setenv("LINE_PUSH_ENABLED", "false")
+        from gateway.config import PlatformConfig
+        cfg = PlatformConfig(enabled=True, extra={})
+        result = asyncio.run(_standalone_send(cfg, "Uchat", "hello"))
+        assert result == {"error": "LINE Push API is disabled"}
+
 
 class TestPostbackButtonShape:
 
@@ -555,6 +1543,33 @@ class TestPostbackButtonShape:
         long = "x" * 500
         msg = build_postback_button_message(long, "Tap", "rid")
         assert len(msg["altText"]) <= 400
+
+    def test_workbench_handoff_offers_web_and_line_actions(self):
+        msg = build_workbench_handoff_message(
+            "工作仍在進行中", "https://example.com/workbench?id=1", "rid-1"
+        )
+        actions = msg["template"]["actions"]
+        assert [action["type"] for action in actions] == ["uri", "postback"]
+        assert actions[0]["label"] == "開啟工作臺"
+        assert json.loads(actions[1]["data"]) == {
+            "action": "show_response",
+            "request_id": "rid-1",
+        }
+
+    def test_ticket_card_offers_status_and_liff_actions(self):
+        msg = build_workbench_ticket_message(
+            "已收到工作需求，等待負責人核准。",
+            "https://example.com/workbench/benew/ticket/abc",
+            "ticket-1",
+        )
+        actions = msg["template"]["actions"]
+        assert [action["type"] for action in actions] == ["uri", "postback"]
+        assert actions[0]["label"] == "開啟 Ticket"
+        assert actions[1]["label"] == "顯示 Ticket 現況"
+        assert json.loads(actions[1]["data"]) == {
+            "action": "ticket_status",
+            "ticket_id": "ticket-1",
+        }
 
 
 class TestCheckRequirements:
@@ -590,6 +1605,34 @@ class TestValidateConfig:
 
 class TestAdapterInit:
 
+    def test_profile_channel_env_isolated_from_general_env(self, monkeypatch, tmp_path):
+        channel_env = tmp_path / "m1-hermes.env"
+        channel_env.write_text(
+            "\n".join([
+                "LINE_CHANNEL_ACCESS_TOKEN=profile-token",
+                "LINE_CHANNEL_SECRET=profile-secret",
+                "LINE_PORT=8765",
+                "LINE_WEBHOOK_PATH=/line-profile/webhook",
+                "UNRELATED_SECRET=ignored",
+            ]),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LINE_CHANNEL_ENV_FILE", str(channel_env))
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "general-token")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "general-secret")
+        monkeypatch.delenv("LINE_PORT", raising=False)
+        monkeypatch.delenv("LINE_WEBHOOK_PATH", raising=False)
+
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(PlatformConfig(enabled=True))
+
+        assert ad.channel_access_token == "profile-token"
+        assert ad.channel_secret == "profile-secret"
+        assert ad.webhook_port == 8765
+        assert ad.webhook_path == "/line-profile/webhook"
+        assert _env_enablement()["port"] == 8765
+        assert "UNRELATED_SECRET" not in __import__("os").environ
+
     def test_init_from_config_extra(self, monkeypatch):
         for k in ("LINE_CHANNEL_ACCESS_TOKEN", "LINE_CHANNEL_SECRET", "LINE_PORT"):
             monkeypatch.delenv(k, raising=False)
@@ -614,6 +1657,9 @@ class TestAdapterInit:
     def test_env_overrides_extra(self, monkeypatch):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "env-tok")
         monkeypatch.setenv("LINE_PORT", "1234")
+        monkeypatch.setenv("LINE_WEBHOOK_PATH", "/line-m1-hermes/webhook")
+        monkeypatch.setenv("LINE_WORKBENCH_AGENT_ID", "m1-hermes")
+        monkeypatch.setenv("LINE_WORKBENCH_PROFILE", "__default__")
         from gateway.config import PlatformConfig
         cfg = PlatformConfig(
             enabled=True,
@@ -622,6 +1668,9 @@ class TestAdapterInit:
         ad = LineAdapter(cfg)
         assert ad.channel_access_token == "env-tok"
         assert ad.webhook_port == 1234
+        assert ad.webhook_path == "/line-m1-hermes/webhook"
+        assert ad.workbench_agent_id == "m1-hermes"
+        assert ad.workbench_profile == "__default__"
 
     def test_csv_allowlist_parsed(self, monkeypatch):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
@@ -641,6 +1690,26 @@ class TestAdapterInit:
         assert asyncio.run(ad.get_chat_info("U123"))["type"] == "dm"
         assert asyncio.run(ad.get_chat_info("C123"))["type"] == "group"
         assert asyncio.run(ad.get_chat_info("R123"))["type"] == "channel"
+
+    def test_workbench_policy_defaults_to_one_twenty_second_deadline(self, monkeypatch):
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
+        monkeypatch.delenv("LINE_SLOW_RESPONSE_THRESHOLD", raising=False)
+        monkeypatch.delenv("LINE_WORKBENCH_MODE", raising=False)
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(PlatformConfig(enabled=True))
+        assert ad.slow_response_threshold == 20.0
+        assert ad.workbench_mode == "standard"
+
+    def test_workbench_first_mode_and_aliases_are_configurable(self, monkeypatch):
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
+        monkeypatch.setenv("LINE_WORKBENCH_MODE", "workbench-first")
+        monkeypatch.setenv("LINE_MENTION_ALIASES", "m1-hermes, m1")
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(PlatformConfig(enabled=True))
+        assert ad.workbench_mode == "workbench-first"
+        assert ad.mention_aliases == {"m1-hermes", "m1"}
 
 
 # ---------------------------------------------------------------------------

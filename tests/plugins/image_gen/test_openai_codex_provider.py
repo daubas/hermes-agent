@@ -66,6 +66,13 @@ class TestMetadata:
         schema = provider.get_setup_schema()
         assert schema["env_vars"] == []
         assert schema["badge"] == "free"
+        assert "text-to-image only" not in schema["tag"]
+
+    def test_capabilities_include_reference_images(self, provider):
+        assert provider.capabilities() == {
+            "modalities": ["text", "image"],
+            "max_reference_images": 16,
+        }
 
 
 # ── Availability ────────────────────────────────────────────────────────────
@@ -159,6 +166,56 @@ class TestGenerate:
         assert tool["output_format"] == "png"
         assert tool["background"] == "opaque"
         assert tool["partial_images"] == 1
+
+    def test_reference_images_are_sent_as_responses_image_inputs(
+        self, provider, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+        local_ref = tmp_path / "reference.png"
+        local_ref.write_bytes(bytes.fromhex(_PNG_HEX))
+        data_ref = f"data:image/png;base64,{_b64_png()}"
+        captured = {}
+
+        def _collect(token, *, prompt, size, quality, reference_images):
+            captured.update(codex_plugin._build_responses_payload(
+                prompt=prompt,
+                size=size,
+                quality=quality,
+                reference_images=reference_images,
+            ))
+            return _b64_png()
+
+        monkeypatch.setattr(codex_plugin, "_collect_image_b64", _collect)
+
+        result = provider.generate(
+            "Keep the composition and add a red notebook",
+            image_url=str(local_ref),
+            reference_image_urls=["https://example.com/style.webp", data_ref],
+        )
+
+        assert result["success"] is True
+        assert result["modality"] == "image"
+        content = captured["input"][0]["content"]
+        assert content[0] == {
+            "type": "input_text",
+            "text": "Keep the composition and add a red notebook",
+        }
+        assert content[1]["type"] == "input_image"
+        assert content[1]["image_url"].startswith("data:image/png;base64,")
+        assert content[2] == {
+            "type": "input_image",
+            "image_url": "https://example.com/style.webp",
+        }
+        assert content[3] == {"type": "input_image", "image_url": data_ref}
+        assert captured["tools"][0]["action"] == "edit"
+
+    def test_missing_local_reference_returns_io_error(self, provider, monkeypatch):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+
+        result = provider.generate("edit this", image_url="/missing/reference.png")
+
+        assert result["success"] is False
+        assert result["error_type"] == "io_error"
 
     def test_partial_image_event_used_when_done_missing(self):
         """If output_item.done is missing, partial_image_b64 is accepted."""

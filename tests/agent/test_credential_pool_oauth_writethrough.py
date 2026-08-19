@@ -38,14 +38,21 @@ def _read_store(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _entry(provider: str, *, id: str, access_token: str, refresh_token: str):
+def _entry(
+    provider: str,
+    *,
+    id: str,
+    access_token: str,
+    refresh_token: str,
+    source: str = "device_code",
+):
     return PooledCredential(
         provider=provider,
         id=id,
         label="cred",
         auth_type=AUTH_TYPE_OAUTH,
         priority=0,
-        source="device_code",
+        source=source,
         access_token=access_token,
         refresh_token=refresh_token,
     )
@@ -188,3 +195,118 @@ def test_write_through_helper_is_noop_in_classic_mode(monkeypatch, tmp_path):
     CP._write_through_provider_state_to_global_root(
         "openai-codex", {"tokens": {"access_token": "a", "refresh_token": "r"}}
     )
+
+
+def test_codex_refresh_locks_and_commits_the_global_owner(
+    profile_and_root, monkeypatch
+):
+    """A profile fallback refresh updates root without creating a profile copy."""
+    profile_path, root_path = profile_and_root
+    entry = _entry(
+        "openai-codex",
+        id="root-entry",
+        access_token="old-access",
+        refresh_token="old-refresh",
+    )
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                    }
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [{
+                    "id": "root-entry",
+                    "source": "device_code",
+                    "auth_type": "oauth",
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                }]
+            },
+        },
+    )
+    monkeypatch.setattr(
+        A,
+        "refresh_codex_oauth_pure",
+        lambda *_a, **_k: {
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "last_refresh": "2026-07-16T00:00:00Z",
+        },
+    )
+
+    refreshed = CredentialPool("openai-codex", [entry])._refresh_entry(
+        entry, force=True
+    )
+
+    assert refreshed is not None
+    root = _read_store(root_path)
+    assert root["providers"]["openai-codex"]["tokens"]["refresh_token"] == "new-refresh"
+    assert root["credential_pool"]["openai-codex"][0]["refresh_token"] == "new-refresh"
+    profile = _read_store(profile_path)
+    assert profile.get("providers") == {}
+    assert "credential_pool" not in profile
+
+
+def test_independent_manual_codex_refresh_does_not_replace_singleton(
+    profile_and_root, monkeypatch
+):
+    """An independent manual account updates only its exact pool entry."""
+    profile_path, root_path = profile_and_root
+    entry = _entry(
+        "openai-codex",
+        id="manual-b",
+        access_token="account-b-access",
+        refresh_token="account-b-refresh",
+        source="manual:device_code",
+    )
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "account-a-access",
+                        "refresh_token": "account-a-refresh",
+                    }
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [{
+                    "id": "manual-b",
+                    "source": "manual:device_code",
+                    "auth_type": "oauth",
+                    "access_token": "account-b-access",
+                    "refresh_token": "account-b-refresh",
+                }]
+            },
+        },
+    )
+    monkeypatch.setattr(
+        A,
+        "refresh_codex_oauth_pure",
+        lambda *_a, **_k: {
+            "access_token": "account-b-new-access",
+            "refresh_token": "account-b-new-refresh",
+        },
+    )
+
+    refreshed = CredentialPool("openai-codex", [entry])._refresh_entry(
+        entry, force=True
+    )
+
+    assert refreshed is not None
+    root = _read_store(root_path)
+    singleton = root["providers"]["openai-codex"]["tokens"]
+    manual = root["credential_pool"]["openai-codex"][0]
+    assert singleton["access_token"] == "account-a-access"
+    assert manual["access_token"] == "account-b-new-access"

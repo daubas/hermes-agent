@@ -9,6 +9,7 @@ Covers:
 """
 
 import asyncio
+import json
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -226,6 +227,53 @@ class TestRunStatus:
                 assert status["last_event"] == "run.completed"
 
     @pytest.mark.asyncio
+    async def test_status_completed_run_includes_generated_image_artifacts(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "final_response": "圖片完成。",
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "id": "call_image",
+                                "type": "function",
+                                "function": {"name": "image_generate", "arguments": "{}"},
+                            }],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "call_image",
+                            "content": json.dumps({
+                                "success": True,
+                                "image": "/tmp/workbench-generated.png",
+                            }),
+                        },
+                        {"role": "assistant", "content": "圖片完成。"},
+                    ],
+                }
+                mock_agent.session_prompt_tokens = 4
+                mock_agent.session_completion_tokens = 2
+                mock_agent.session_total_tokens = 6
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "請產一張圖"})
+                run_id = (await resp.json())["run_id"]
+
+                for _ in range(20):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert status["artifacts"] == [
+                    {"type": "image", "path": "/tmp/workbench-generated.png"},
+                ]
+
+    @pytest.mark.asyncio
     async def test_status_reflects_explicit_session_id(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -303,6 +351,52 @@ class TestRunEvents:
                 # Should contain run.completed
                 assert "run.completed" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_pollable_status_includes_redacted_pending_approval(self, adapter):
+        app = _create_runs_app(adapter)
+        release_agent = threading.Event()
+        approval_registered = threading.Event()
+
+        def register_notify(_session_key, callback):
+            callback({
+                "command": "curl -H 'Authorization: Bearer top-secret' https://example.test",
+                "description": "Send a request",
+                "pattern_key": "curl",
+                "pattern_keys": ["curl"],
+                "allow_permanent": False,
+            })
+            approval_registered.set()
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_create_agent") as mock_create,
+                patch("tools.approval.register_gateway_notify", side_effect=register_notify),
+                patch("tools.approval.unregister_gateway_notify"),
+            ):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.side_effect = lambda **_kwargs: (
+                    release_agent.wait(timeout=3),
+                    {"final_response": "done"},
+                )[1]
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                assert approval_registered.wait(timeout=3)
+
+                status_resp = await cli.get(f"/v1/runs/{run_id}")
+                status = await status_resp.json()
+                assert status["status"] == "waiting_for_approval"
+                assert status["approval"]["description"] == "Send a request"
+                assert status["approval"]["allow_permanent"] is False
+                assert status["approval"]["choices"] == ["once", "session", "deny"]
+                assert "top-secret" not in json.dumps(status)
+
+                release_agent.set()
 
 
 

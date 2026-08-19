@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from utils import atomic_replace
 
 
@@ -241,6 +241,21 @@ def load_hermes_dotenv(
     if project_env_path and project_env_path.exists():
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
         loaded.append(project_env_path)
+
+    for prefix in ("LINE", "TELEGRAM"):
+        channel_env_value = os.getenv(f"{prefix}_CHANNEL_ENV_FILE", "").strip()
+        if not channel_env_value:
+            continue
+        channel_env = Path(channel_env_value).expanduser()
+        if not channel_env.is_file():
+            continue
+        _sanitize_env_file_if_needed(channel_env)
+        values = dotenv_values(channel_env, encoding="utf-8")
+        for key, value in values.items():
+            if key.startswith(f"{prefix}_") and value is not None:
+                os.environ[key] = str(value)
+        _sanitize_loaded_credentials()
+        loaded.append(channel_env)
 
     _apply_external_secret_sources(home_path)
     _apply_managed_env()

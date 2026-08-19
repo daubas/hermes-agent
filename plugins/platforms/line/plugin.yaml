@@ -27,6 +27,10 @@ requires_env:
     url: "https://developers.line.biz/console/"
     password: true
 optional_env:
+  - name: LINE_CHANNEL_ENV_FILE
+    description: "Profile-specific file containing this gateway's LINE_* settings"
+    prompt: "LINE channel env file"
+    password: false
   - name: LINE_PORT
     description: "Webhook listen port (default: 8646)"
     prompt: "Webhook port"
@@ -35,9 +39,17 @@ optional_env:
     description: "Webhook bind host (default: 0.0.0.0)"
     prompt: "Webhook host"
     password: false
+  - name: LINE_WEBHOOK_PATH
+    description: "Agent-specific webhook path (default: /line/webhook)"
+    prompt: "Webhook path"
+    password: false
   - name: LINE_PUBLIC_URL
     description: "Public HTTPS base URL for serving images/audio/video to LINE (e.g. https://my-tunnel.example.com). Required for media sending when the bind address is not directly reachable."
     prompt: "Public HTTPS base URL"
+    password: false
+  - name: LINE_PUSH_ENABLED
+    description: "Allow metered Messaging API Push calls and reply-token fallback (default: true)"
+    prompt: "Enable Push API? (true/false)"
     password: false
   - name: LINE_ALLOWED_USERS
     description: "Comma-separated LINE user IDs allowed to DM the bot (U-prefixed)"
@@ -60,6 +72,42 @@ optional_env:
     prompt: "Home channel ID (or empty)"
     password: false
   - name: LINE_SLOW_RESPONSE_THRESHOLD
-    description: "Seconds before the slow-LLM postback button fires (default: 45; set 0 to disable and always Push-fallback)"
+    description: "Fallback deadline before an in-flight answer moves to Workbench (default: 20; set 0 to disable)"
     prompt: "Slow response threshold (seconds)"
+    password: false
+  - name: LINE_WORKBENCH_URL
+    description: "Workbench or LIFF URL used for the current Hermes profile"
+    prompt: "Workbench URL"
+    password: false
+  - name: LINE_WORKBENCH_AGENT_ID
+    description: "Trusted Workbench agent identifier written into handoff records"
+    prompt: "Workbench agent ID"
+    password: false
+  - name: LINE_WORKBENCH_PROFILE
+    description: "Hermes profile ownership written into Workbench handoff records"
+    prompt: "Workbench Hermes profile"
+    password: false
+  - name: LINE_WORKBENCH_MODE
+    description: "standard keeps quick replies in LINE; workbench-first opens Workbench immediately"
+    prompt: "Workbench mode (standard/workbench-first)"
+    password: false
+  - name: LINE_WORKBENCH_TRIGGERS
+    description: "Comma-separated words that explicitly request Workbench"
+    prompt: "Workbench trigger words"
+    password: false
+  - name: LINE_WORKBENCH_HANDOFF_DIR
+    description: "Shared directory for atomic Workbench handoff records"
+    prompt: "Workbench handoff directory"
+    password: false
+  - name: LINE_REQUIRE_MENTION
+    description: "Require a real LINE mention or configured alias in groups and rooms"
+    prompt: "Require group mention? (true/false)"
+    password: false
+  - name: LINE_OBSERVE_UNMENTIONED_GROUP_MESSAGES
+    description: "Store approved group chatter as context without running the Agent; requires LINE_REQUIRE_MENTION=true"
+    prompt: "Observe unmentioned group messages? (true/false)"
+    password: false
+  - name: LINE_MENTION_ALIASES
+    description: "Comma-separated text aliases accepted as mentions, without the @ prefix"
+    prompt: "Mention aliases"
     password: false

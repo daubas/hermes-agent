@@ -1479,6 +1479,32 @@ class SessionStore:
             logger.debug("has_platform_message_id lookup failed", exc_info=True)
             return False
 
+    def find_platform_message(
+        self, source: str, platform_message_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Find a persisted message across session resets for one platform."""
+        if not self._db:
+            return None
+        try:
+            return self._db.find_platform_message(source, platform_message_id)
+        except Exception:
+            logger.debug("find_platform_message lookup failed", exc_info=True)
+            return None
+
+    def attach_platform_message_id(
+        self, session_id: str, platform_message_id: str, content: str
+    ) -> bool:
+        """Attach an inbound platform ID after the agent persists its turn."""
+        if not self._db:
+            return False
+        try:
+            return self._db.attach_platform_message_id(
+                session_id, platform_message_id, content
+            )
+        except Exception:
+            logger.debug("attach_platform_message_id failed", exc_info=True)
+            return False
+
     def rewrite_transcript(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Replace the entire transcript for a session with new messages.
 

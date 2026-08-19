@@ -61,6 +61,15 @@ class TestHasPlatformMessageId:
         assert store.has_platform_message_id("s1", "msg-456")
         assert not store.has_platform_message_id("s1", "msg-000")
 
+    def test_attach_id_to_agent_persisted_user_row(self, tmp_path):
+        db = self._make_db(tmp_path)
+        db.append_message(session_id="s1", role="user", content="hello")
+        store = SessionStore.__new__(SessionStore)
+        store._db = db
+
+        assert store.attach_platform_message_id("s1", "msg-457", "hello")
+        assert store.has_platform_message_id("s1", "msg-457")
+
 
 class TestDedupeOnTransientFailure:
     """The gateway's transient-failure path must not persist duplicates."""

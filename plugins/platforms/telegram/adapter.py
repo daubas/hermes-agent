@@ -17,6 +17,7 @@ import html as _html
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
+from urllib.parse import urlencode
 
 logger = logging.getLogger(__name__)
 
@@ -6370,11 +6371,39 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         await self._ensure_forum_commands(update.message)
 
+        cleaned_text = self._clean_bot_trigger_text(msg.text)
+        if self._is_workbench_request(cleaned_text):
+            await self._send_workbench_link(msg)
+            return
+
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
-        event.text = self._clean_bot_trigger_text(event.text)
+        event.text = cleaned_text
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
+
+    def _is_workbench_request(self, text: Optional[str]) -> bool:
+        value = (text or "").strip().lower()
+        triggers = os.getenv("TELEGRAM_WORKBENCH_TRIGGERS", "workbench,工作臺,工作台")
+        return bool(value) and any(value == item.strip().lower() for item in triggers.split(",") if item.strip())
+
+    async def _send_workbench_link(self, message: Message) -> None:
+        base_url = os.getenv("TELEGRAM_WORKBENCH_URL", "").strip()
+        if not base_url:
+            return
+        event = self._build_message_event(message, MessageType.TEXT)
+        source = event.source
+        params = {
+            "source": "telegram",
+            "chat_id": source.chat_id,
+            "chat_type": source.chat_type,
+            "user_id": source.user_id or source.chat_id,
+        }
+        if source.thread_id:
+            params["thread_id"] = source.thread_id
+        url = base_url + ("&" if "?" in base_url else "?") + urlencode(params)
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("開啟工作臺", url=url)]])
+        await message.reply_text("開啟 Workbench", reply_markup=keyboard)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""

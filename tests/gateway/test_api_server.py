@@ -470,6 +470,13 @@ class TestConcurrencyCap:
         assert resp is not None
         assert resp.status == 429
 
+    def test_completed_polling_run_does_not_hold_a_concurrency_slot(self):
+        adapter = _make_adapter()
+        adapter._max_concurrent_runs = 1
+        adapter._run_streams = {"r1": object()}
+        adapter._run_statuses = {"r1": {"status": "completed"}}
+        assert adapter._concurrency_limited_response() is None
+
     def test_zero_disables_cap(self):
         adapter = _make_adapter()
         adapter._max_concurrent_runs = 0

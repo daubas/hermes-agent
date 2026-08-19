@@ -275,6 +275,12 @@ class GatewayAuthorizationMixin:
                     if "*" in allowed_group_ids or source.chat_id in allowed_group_ids:
                         return True
 
+        # Some adapters intentionally omit the sender ID to share one group
+        # session after verifying access themselves. Honor only the explicit
+        # boolean marker they attach to that trusted source.
+        if getattr(source, "role_authorized", False) is True:
+            return True
+
         if not user_id:
             return False
 
@@ -347,14 +353,6 @@ class GatewayAuthorizationMixin:
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
         platform_allow_all_var = platform_allow_all_map.get(source.platform, "")
         if platform_allow_all_var and os.getenv(platform_allow_all_var, "").lower() in {"true", "1", "yes"}:
-            return True
-
-        # Adapter-verified role auth: the Discord adapter already confirmed the
-        # user holds a role in DISCORD_ALLOWED_ROLES before dispatching the message.
-        # Compare with ``is True`` so the real bool field authorizes while a
-        # MagicMock source (test fixtures using ``object.__new__`` runners with
-        # mock sources) does not auto-truthy through this gate (see pitfall #13).
-        if getattr(source, "role_authorized", False) is True:
             return True
 
         if getattr(source, "is_bot", False):

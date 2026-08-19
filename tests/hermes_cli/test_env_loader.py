@@ -69,6 +69,29 @@ def test_user_env_takes_precedence_over_project_env(tmp_path, monkeypatch):
     assert os.getenv("OPENAI_API_KEY") == "project-key"
 
 
+def test_telegram_channel_env_overrides_only_telegram_settings(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    user_env = home / ".env"
+    channel_env = home / "channels" / "telegram.env"
+    channel_env.parent.mkdir()
+    user_env.write_text(
+        "TELEGRAM_BOT_TOKEN=general-token\nOPENAI_API_KEY=general-openai\n",
+        encoding="utf-8",
+    )
+    channel_env.write_text(
+        "TELEGRAM_BOT_TOKEN=profile-token\nOPENAI_API_KEY=channel-openai\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TELEGRAM_CHANNEL_ENV_FILE", str(channel_env))
+
+    loaded = load_hermes_dotenv(hermes_home=home)
+
+    assert loaded == [user_env, channel_env]
+    assert os.getenv("TELEGRAM_BOT_TOKEN") == "profile-token"
+    assert os.getenv("OPENAI_API_KEY") == "general-openai"
+
+
 def test_null_bytes_in_user_env_are_stripped(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
     home.mkdir()

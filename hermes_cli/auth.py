@@ -3469,7 +3469,241 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
         _save_auth_store(auth_store)
 
 
-def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
+def _provider_auth_owner_path(
+    provider_id: str,
+    *,
+    credential_id: Optional[str] = None,
+    access_token: Optional[str] = None,
+) -> Path:
+    """Return the store that owns a provider singleton or exact pool entry.
+
+    Named profiles may read a provider from the global-root fallback.  Refresh
+    must therefore lock and update the store that supplied the credential,
+    rather than materialising another rotating-token copy in the profile.
+    """
+    local_path = Path(_auth_file_path())
+    global_path = _global_auth_file_path()
+    paths = [local_path]
+    if global_path is not None and Path(global_path) != local_path:
+        paths.append(Path(global_path))
+
+    stores = [(path, _load_auth_store(path)) for path in paths]
+
+    if credential_id:
+        for path, store in stores:
+            pool = store.get("credential_pool")
+            entries = pool.get(provider_id) if isinstance(pool, dict) else None
+            if isinstance(entries, list) and any(
+                isinstance(item, dict) and str(item.get("id") or "") == credential_id
+                for item in entries
+            ):
+                return path
+
+        if access_token:
+            for path, store in stores:
+                providers = store.get("providers")
+                state = providers.get(provider_id) if isinstance(providers, dict) else None
+                tokens = state.get("tokens") if isinstance(state, dict) else None
+                if (
+                    isinstance(tokens, dict)
+                    and str(tokens.get("access_token") or "") == access_token
+                ):
+                    return path
+        return local_path
+
+    for path, store in stores:
+        providers = store.get("providers")
+        if isinstance(providers, dict) and isinstance(providers.get(provider_id), dict):
+            return path
+    return local_path
+
+
+def _auth_store_refresh_lock(auth_path: Path):
+    """Process-safe exclusive lock for one rotating credential owner store."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _locked():
+        target = Path(auth_path)
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(target.parent, 0o700)
+        except OSError:
+            pass
+        lock_path = target.with_name(f".{target.name}.refresh.lock")
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(lock_path, flags, 0o600)
+        try:
+            try:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except ImportError:  # pragma: no cover - Windows fallback
+                pass
+            yield target
+        finally:
+            try:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except ImportError:  # pragma: no cover - Windows fallback
+                pass
+            os.close(fd)
+
+    return _locked()
+
+
+def _read_owned_codex_tokens(
+    auth_path: Path,
+    *,
+    credential_id: Optional[str] = None,
+) -> Optional[Dict[str, str]]:
+    """Read the current token pair directly from its owner store."""
+    auth_store = _load_auth_store(Path(auth_path))
+    if credential_id:
+        pool = auth_store.get("credential_pool")
+        entries = pool.get("openai-codex") if isinstance(pool, dict) else None
+        if isinstance(entries, list):
+            for item in entries:
+                if not isinstance(item, dict) or str(item.get("id") or "") != credential_id:
+                    continue
+                access = str(item.get("access_token") or "").strip()
+                refresh = str(item.get("refresh_token") or "").strip()
+                if access and refresh:
+                    result = {"access_token": access, "refresh_token": refresh}
+                    if item.get("last_refresh"):
+                        result["last_refresh"] = str(item["last_refresh"])
+                    return result
+
+    providers = auth_store.get("providers")
+    state = providers.get("openai-codex") if isinstance(providers, dict) else None
+    tokens = state.get("tokens") if isinstance(state, dict) else None
+    if not isinstance(tokens, dict):
+        return None
+    access = str(tokens.get("access_token") or "").strip()
+    refresh = str(tokens.get("refresh_token") or "").strip()
+    if not access or not refresh:
+        return None
+    return dict(tokens)
+
+
+def _commit_owned_codex_tokens(
+    auth_path: Path,
+    tokens: Dict[str, str],
+    *,
+    last_refresh: Optional[str] = None,
+    credential_id: Optional[str] = None,
+    credential_source: Optional[str] = None,
+    previous_access_token: Optional[str] = None,
+) -> Path:
+    """Atomically persist a Codex rotation to its singleton and pool aliases."""
+    owner_path = Path(auth_path)
+    auth_store = _load_auth_store(owner_path)
+    providers = auth_store.get("providers")
+    state = providers.get("openai-codex") if isinstance(providers, dict) else None
+    state = dict(state) if isinstance(state, dict) else {}
+    previous_singleton_tokens = (
+        dict(state.get("tokens")) if isinstance(state.get("tokens"), dict) else None
+    )
+    previous_singleton_access = str(
+        (previous_singleton_tokens or {}).get("access_token") or ""
+    )
+    refresh_time = (
+        last_refresh
+        or str(tokens.get("last_refresh") or "").strip()
+        or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    )
+
+    singleton_alias = credential_id is None or credential_source == "device_code"
+    if (
+        credential_source == "manual:device_code"
+        and previous_access_token
+        and previous_singleton_access == previous_access_token
+    ):
+        singleton_alias = True
+
+    if singleton_alias:
+        stored_tokens = dict(tokens)
+        stored_tokens.pop("last_refresh", None)
+        state["tokens"] = stored_tokens
+        state["last_refresh"] = refresh_time
+        state["auth_mode"] = "chatgpt"
+        _save_provider_state(auth_store, "openai-codex", state)
+        _sync_codex_pool_entries(
+            auth_store,
+            stored_tokens,
+            refresh_time,
+            previous_singleton_tokens=previous_singleton_tokens,
+        )
+
+    if credential_id:
+        pool = auth_store.get("credential_pool")
+        entries = pool.get("openai-codex") if isinstance(pool, dict) else None
+        if isinstance(entries, list):
+            for item in entries:
+                if not isinstance(item, dict) or str(item.get("id") or "") != credential_id:
+                    continue
+                item["access_token"] = str(tokens.get("access_token") or "")
+                item["refresh_token"] = str(tokens.get("refresh_token") or "")
+                item["last_refresh"] = refresh_time
+                for key in (
+                    "last_status",
+                    "last_status_at",
+                    "last_error_code",
+                    "last_error_reason",
+                    "last_error_message",
+                    "last_error_reset_at",
+                ):
+                    item[key] = None
+                break
+
+    _save_auth_store(auth_store, owner_path)
+    return owner_path
+
+
+def _codex_log_fingerprint(value: Any) -> str:
+    """Return a safe identifier for correlating credentials in logs."""
+    if not value:
+        return "none"
+    import hashlib
+
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
+
+
+def _codex_account_identity(access_token: str) -> Optional[str]:
+    """Extract a Codex account identity from an access JWT without logging it."""
+    if not access_token:
+        return None
+    try:
+        import base64
+
+        payload_segment = access_token.split(".")[1]
+        padding = "=" * (-len(payload_segment) % 4)
+        payload = json.loads(
+            base64.urlsafe_b64decode(payload_segment + padding).decode("utf-8")
+        )
+    except Exception:
+        return None
+
+    auth_claim = payload.get("https://api.openai.com/auth")
+    if isinstance(auth_claim, dict):
+        for key in ("chatgpt_account_id", "account_id"):
+            value = auth_claim.get(key)
+            if value:
+                return str(value)
+
+    for key in ("chatgpt_account_id", "account_id", "sub"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _recover_codex_tokens_from_cli(
+    reason: str,
+    expected_access_token: Optional[str] = None,
+    auth_path: Optional[Path] = None,
+) -> Optional[Dict[str, str]]:
     """Adopt a valid Codex CLI token pair into Hermes auth, if available."""
     imported = _import_codex_cli_tokens()
     # Require BOTH tokens before adopting: persisting a payload without a
@@ -3480,8 +3714,34 @@ def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
         and str(imported.get("refresh_token", "") or "").strip()
     ):
         return None
+
+    if expected_access_token:
+        expected_account = _codex_account_identity(expected_access_token)
+        imported_account = _codex_account_identity(
+            str(imported.get("access_token", "") or "")
+        )
+        if (
+            not expected_account
+            or not imported_account
+            or expected_account != imported_account
+        ):
+            logger.warning(
+                "Codex CLI auth recovery refused: account identity mismatch or unavailable "
+                "(reason=%s expected_account_fp=%s imported_account_fp=%s).",
+                reason,
+                _codex_log_fingerprint(expected_account),
+                _codex_log_fingerprint(imported_account),
+            )
+            return None
     logger.info("Codex auth recovered from Codex CLI auth.json (%s).", reason)
-    _save_codex_tokens(imported)
+    if auth_path is None:
+        _save_codex_tokens(imported)
+    else:
+        _commit_owned_codex_tokens(
+            auth_path,
+            imported,
+            last_refresh=imported.get("last_refresh"),
+        )
     return dict(imported)
 
 
@@ -3621,40 +3881,51 @@ def _refresh_codex_auth_tokens(
     
     Saves the new tokens to Hermes auth store automatically.
     """
-    try:
-        refreshed = refresh_codex_oauth_pure(
-            str(tokens.get("access_token", "") or ""),
-            str(tokens.get("refresh_token", "") or ""),
-            timeout_seconds=timeout_seconds,
-        )
-    except AuthError as exc:
-        # Self-heal cross-store refresh_token rotation. Hermes keeps its OWN
-        # Codex OAuth token (per profile + top-level), separate from the Codex
-        # CLI's ~/.codex/auth.json. OAuth refresh_tokens are single-use, so when
-        # the Codex CLI (or another Hermes process) rotates the shared token,
-        # this frozen copy's refresh_token goes stale and the refresh fails with
-        # a relogin-required error (invalid_grant / refresh_token_reused / 401).
-        # Before surfacing that as a hard 401 to the turn, adopt the canonical
-        # fresh token from ~/.codex/auth.json (the Codex CLI keeps it current) so
-        # idle profiles / desktop sessions recover automatically instead of
-        # 401'ing until a manual re-auth. Transient failures (e.g. 429 quota)
-        # keep relogin_required=False — the stored token is still valid there, so
-        # we never self-heal those and re-raise unchanged.
-        if not getattr(exc, "relogin_required", False):
-            raise
-        imported = _recover_codex_tokens_from_cli(
-            f"refresh_token rejected: {getattr(exc, 'code', None) or 'auth_error'}"
-        )
-        if not imported:
-            raise
-        return imported
+    owner_path = _provider_auth_owner_path("openai-codex")
+    with _auth_store_refresh_lock(owner_path):
+        refresh_input = dict(tokens)
+        owned_tokens = _read_owned_codex_tokens(owner_path)
+        if owned_tokens:
+            refresh_input.update(owned_tokens)
 
-    updated_tokens = dict(tokens)
-    updated_tokens["access_token"] = refreshed["access_token"]
-    updated_tokens["refresh_token"] = refreshed["refresh_token"]
+        try:
+            refreshed = refresh_codex_oauth_pure(
+                str(refresh_input.get("access_token", "") or ""),
+                str(refresh_input.get("refresh_token", "") or ""),
+                timeout_seconds=timeout_seconds,
+            )
+        except AuthError as exc:
+            # Only terminal token errors may adopt Codex CLI credentials, and
+            # the CLI account must match the account that owned this refresh.
+            if not getattr(exc, "relogin_required", False):
+                raise
+            error_code = getattr(exc, "code", None) or "auth_error"
+            logger.warning(
+                "Codex OAuth refresh rejected "
+                "(error_type=%s error_code=%s relogin_required=true access_fp=%s refresh_fp=%s).",
+                type(exc).__name__,
+                error_code,
+                _codex_log_fingerprint(refresh_input.get("access_token")),
+                _codex_log_fingerprint(refresh_input.get("refresh_token")),
+            )
+            imported = _recover_codex_tokens_from_cli(
+                f"refresh_token rejected: {error_code}",
+                expected_access_token=str(refresh_input.get("access_token", "") or ""),
+                auth_path=owner_path,
+            )
+            if not imported:
+                raise
+            return imported
 
-    _save_codex_tokens(updated_tokens)
-    return updated_tokens
+        updated_tokens = dict(refresh_input)
+        updated_tokens["access_token"] = refreshed["access_token"]
+        updated_tokens["refresh_token"] = refreshed["refresh_token"]
+        _commit_owned_codex_tokens(
+            owner_path,
+            updated_tokens,
+            last_refresh=refreshed.get("last_refresh"),
+        )
+        return updated_tokens
 
 
 def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:

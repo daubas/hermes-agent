@@ -92,6 +92,30 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+_IMAGE_ARTIFACT_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+def _generated_run_artifacts(result: Any, history_offset: int = 0) -> List[Dict[str, str]]:
+    """Return current-turn generated images as structured API artifacts."""
+    if not isinstance(result, dict):
+        return []
+
+    from gateway.run import _collect_auto_append_media_tags
+
+    tags, _ = _collect_auto_append_media_tags(
+        result.get("messages", []),
+        history_offset=history_offset,
+    )
+    artifacts = []
+    seen = set()
+    for tag in tags:
+        raw_path = tag.removeprefix("MEDIA:")
+        path = os.path.abspath(os.path.expanduser(raw_path))
+        if Path(path).suffix.lower() not in _IMAGE_ARTIFACT_SUFFIXES or path in seen:
+            continue
+        seen.add(path)
+        artifacts.append({"type": "image", "path": path})
+    return artifacts
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -3645,14 +3669,21 @@ class APIServerAdapter(BasePlatformAdapter):
 
         The cap bounds total in-flight agent activity across every
         agent-serving endpoint: the non-streaming chat/responses paths
-        (tracked by ``_inflight_agent_runs``) plus the ``/v1/runs`` streaming
-        path (tracked by ``_run_streams``). A configured value of 0 disables
-        the cap entirely.
+        (tracked by ``_inflight_agent_runs``) plus non-terminal ``/v1/runs``.
+        Completed run queues stay available for a late SSE subscriber, so the
+        presence of a queue alone must not consume a concurrency slot. A
+        configured value of 0 disables the cap entirely.
         """
         limit = self._max_concurrent_runs
         if limit <= 0:
             return None
-        inflight = self._inflight_agent_runs + len(self._run_streams)
+        terminal_statuses = {"completed", "failed", "cancelled"}
+        active_runs = sum(
+            1
+            for run_id in self._run_streams
+            if self._run_statuses.get(run_id, {}).get("status") not in terminal_statuses
+        )
+        inflight = self._inflight_agent_runs + active_runs
         if inflight >= limit:
             return web.json_response(
                 _openai_error(
@@ -3781,6 +3812,8 @@ class APIServerAdapter(BasePlatformAdapter):
         """Update pollable run status without exposing private agent objects."""
         now = time.time()
         current = self._run_statuses.get(run_id, {})
+        if status != "waiting_for_approval":
+            current.pop("approval", None)
         current.update({
             "object": "hermes.run",
             "run_id": run_id,
@@ -3972,16 +4005,26 @@ class APIServerAdapter(BasePlatformAdapter):
                         from gateway.run import _redact_approval_command
 
                         event["command"] = _redact_approval_command(event.get("command"))
+                    choices = ["once", "session"]
+                    if event.get("allow_permanent", True):
+                        choices.append("always")
+                    choices.append("deny")
                     event.update({
                         "event": "approval.request",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "choices": ["once", "session", "always", "deny"],
+                        "choices": choices,
                     })
                     self._set_run_status(
                         run_id,
                         "waiting_for_approval",
                         last_event="approval.request",
+                        approval={
+                            "command": event.get("command", ""),
+                            "description": event.get("description", ""),
+                            "allow_permanent": bool(event.get("allow_permanent", True)),
+                            "choices": choices,
+                        },
                     )
                     try:
                         loop.call_soon_threadsafe(q.put_nowait, event)
@@ -4055,17 +4098,23 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                    artifacts = _generated_run_artifacts(
+                        result,
+                        history_offset=len(conversation_history),
+                    )
                     q.put_nowait({
                         "event": "run.completed",
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "output": final_response,
+                        "artifacts": artifacts,
                         "usage": usage,
                     })
                     self._set_run_status(
                         run_id,
                         "completed",
                         output=final_response,
+                        artifacts=artifacts,
                         usage=usage,
                         last_event="run.completed",
                     )
