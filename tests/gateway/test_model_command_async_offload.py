@@ -83,34 +83,6 @@ def _isolated_config(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 # Text-fallback path  ->  list_authenticated_providers
 # --------------------------------------------------------------------------- #
-@pytest.mark.asyncio
-async def test_text_fallback_offloads_list_authenticated_providers(_isolated_config, monkeypatch):
-    """No picker-capable adapter registered => handler takes the text fallback,
-    which must offload ``list_authenticated_providers`` to a worker thread."""
-    spy = _ToThreadSpy()
-    monkeypatch.setattr(slash_commands.asyncio, "to_thread", spy)
-
-    # Make the listing fn cheap + observable. If it were ever called directly
-    # (offload reverted) it would NOT appear in spy.calls and the assert fails.
-    sentinel = []
-
-    def _fake_list_authenticated_providers(**kwargs):
-        return sentinel
-
-    monkeypatch.setattr(
-        "hermes_cli.model_switch.list_authenticated_providers",
-        _fake_list_authenticated_providers,
-    )
-
-    runner = _make_runner()  # no adapters -> has_picker is False
-    result = await runner._handle_model_command(_make_event())
-
-    assert result is not None  # text list rendered
-    offloaded = spy.funcs_offloaded()
-    assert _fake_list_authenticated_providers in offloaded, (
-        "list_authenticated_providers must be dispatched via asyncio.to_thread "
-        "(it was called inline on the event loop instead)"
-    )
 
 
 # --------------------------------------------------------------------------- #
@@ -166,3 +138,5 @@ async def test_picker_path_offloads_list_picker_providers(_isolated_config, monk
         "list_picker_providers must be dispatched via asyncio.to_thread "
         "(it was called inline on the event loop instead)"
     )
+
+

@@ -12,14 +12,16 @@
 import { useStore } from '@nanostores/react'
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 
+import { $registryVersion } from '@/contrib/registry'
 import { matchesQuery, useMediaQuery } from '@/hooks/use-media-query'
 import { persistString, persistStringRecord, storedString, storedStringRecord } from '@/lib/storage'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 
+import { $backendThemes, $pendingSkinApply } from './backend-sync'
 import { hexToRgb, mix, readableOn } from './color'
-import { BUILTIN_THEME_LIST, BUILTIN_THEMES, DEFAULT_SKIN_NAME, DEFAULT_TYPOGRAPHY, nousTheme } from './presets'
+import { BUILTIN_THEME_LIST, DEFAULT_SKIN_NAME, DEFAULT_TYPOGRAPHY, nousTheme } from './presets'
 import type { DesktopTheme, DesktopThemeColors } from './types'
-import { $userThemes, resolveTheme } from './user-themes'
+import { $userThemes, listAllThemes, resolveTheme } from './user-themes'
 
 // Legacy global skin (pre per-profile themes). Still the inheritance fallback
 // for any profile without its own assignment, so single-profile users and old
@@ -66,6 +68,9 @@ const profilePref = <T extends string>(record: string, legacy: string, normalize
 
 export const skinPref = profilePref(PROFILE_SKINS_KEY, SKIN_KEY, normalizeSkin)
 export const modePref = profilePref(PROFILE_MODES_KEY, MODE_KEY, normalizeMode)
+
+/** Everything a peer window could change that this one has to repaint for. */
+const APPEARANCE_KEYS = new Set([SKIN_KEY, PROFILE_SKINS_KEY, MODE_KEY, PROFILE_MODES_KEY])
 
 // Last active profile — lets the boot paint pick its appearance before the
 // gateway reports which profile actually launched.
@@ -157,6 +162,12 @@ function renderedModeFor(colors: DesktopThemeColors, mode: 'light' | 'dark'): 'l
 // Per-mode mix knobs. Light/dark fallbacks live in styles.css `:root` /
 // `:root.dark`; setting them inline keeps active-skin overrides surviving
 // the boot-time paint.
+// styles.css --theme-neutral-chrome — keep in sync.
+const NEUTRAL_CHROME = { light: '#f3f3f3', dark: '#0d0d0e' } as const
+
+const chromeBackground = (background: string, isDark: boolean) =>
+  mix(background, NEUTRAL_CHROME[isDark ? 'dark' : 'light'], isDark ? 0.26 : 0.08)
+
 const mixesFor = (isDark: boolean): Record<string, string> => ({
   '--theme-mix-chrome': isDark ? '74%' : '92%',
   '--theme-mix-sidebar': '100%',
@@ -222,8 +233,10 @@ function applyTheme(theme: DesktopTheme, mode: 'light' | 'dark') {
     root.style.setProperty(k, v)
   }
 
+  const chromeBg = chromeBackground(c.background, isDark)
+
   window.hermesDesktop?.setTitleBarTheme?.({
-    background: c.background,
+    background: chromeBg,
     foreground: c.foreground
   })
 
@@ -231,7 +244,7 @@ function applyTheme(theme: DesktopTheme, mode: 'light' | 'dark') {
   // they let a brand-new window paint the themed background on its very first
   // frame, before this module has even loaded.
   try {
-    window.localStorage.setItem('hermes-boot-background', c.background)
+    window.localStorage.setItem('hermes-boot-background', chromeBg)
     window.localStorage.setItem('hermes-boot-color-scheme', rendered)
   } catch {
     // Storage may be unavailable (private mode / quota); the inline script
@@ -306,18 +319,23 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   // behavior is unchanged.
   const profileKey = normalizeProfileKey(useStore($activeGatewayProfile))
 
-  // Built-ins + user-installed themes. Reactive so an import shows up live in
-  // the palette, settings grid, and `/skin` without a reload.
+  // Built-ins + user-installed + registry-contributed themes. Reactive so an
+  // import or a plugin registration shows up live in the palette, settings
+  // grid, and `/skin` without a reload.
   const userThemes = useStore($userThemes)
+  const backendThemes = useStore($backendThemes)
+  const registryVersion = useStore($registryVersion)
 
   const availableThemes = useMemo(
     () =>
-      [...Object.values(BUILTIN_THEMES), ...Object.values(userThemes)].map(({ name, label, description }) => ({
+      listAllThemes().map(({ name, label, description }) => ({
         name,
         label,
         description
       })),
-    [userThemes]
+    // userThemes + backendThemes + registryVersion ARE listAllThemes' reactivity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [userThemes, backendThemes, registryVersion]
   )
 
   const [themeName, setThemeNameState] = useState(() =>
@@ -336,9 +354,38 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setModeState(modePref.resolve(profileKey))
   }, [profileKey])
 
+  // Appearance is per-profile localStorage, and every desktop window is another
+  // renderer on the same origin — so a switch made in the HUD (or any peer
+  // window) only ever repainted the window it was made in. `storage` fires in
+  // the OTHER windows, which is exactly the set that needs to catch up.
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key && !APPEARANCE_KEYS.has(event.key)) {
+        return
+      }
+
+      const live = normalizeProfileKey($activeGatewayProfile.get())
+
+      setThemeNameState(skinPref.resolve(live))
+      setModeState(modePref.resolve(live))
+    }
+
+    window.addEventListener('storage', onStorage)
+
+    return () => window.removeEventListener('storage', onStorage)
+  }, [])
+
   const systemDark = useMediaQuery('(prefers-color-scheme: dark)')
   const resolvedMode = resolveMode(mode, systemDark)
-  const activeTheme = useMemo(() => deriveTheme(themeName, resolvedMode), [themeName, resolvedMode])
+
+  const activeTheme = useMemo(
+    () => deriveTheme(themeName, resolvedMode),
+    // deriveTheme resolves its seed through the merged registry, so the theme
+    // stores are its reactivity too — an in-place palette edit of the ACTIVE
+    // skin (live theme authoring) must repaint, not just a name switch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [themeName, resolvedMode, userThemes, backendThemes, registryVersion]
+  )
 
   // What actually gets painted (matches the `.dark` class applyTheme toggles).
   const renderedMode = useMemo(() => renderedModeFor(activeTheme.colors, resolvedMode), [activeTheme, resolvedMode])
@@ -364,6 +411,18 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     modePref.assign(liveProfile(), next)
   }, [])
 
+  // Drain a backend-driven skin switch (Hermes authoring/activating a skin from a
+  // prompt, or `/skin` on another surface). setTheme persists it per profile, so
+  // the choice sticks like any manual pick.
+  const pendingSkin = useStore($pendingSkinApply)
+
+  useEffect(() => {
+    if (pendingSkin) {
+      setTheme(pendingSkin)
+      $pendingSkinApply.set(null)
+    }
+  }, [pendingSkin, setTheme])
+
   // The light/dark toggle (Shift+X by default) is owned by the keybind runtime
   // (`appearance.toggleMode`) so it shows up in the hotkey map and is rebindable.
 
@@ -376,12 +435,3 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 }
 
 export const useTheme = (): ThemeContextValue => useContext(ThemeContext)
-
-/** Sync the desktop skin with the active Hermes backend theme on connect. */
-export function useSyncThemeFromBackend(backendThemeName: string | undefined, setTheme: (name: string) => void) {
-  useEffect(() => {
-    if (backendThemeName && BUILTIN_THEMES[backendThemeName]) {
-      setTheme(backendThemeName)
-    }
-  }, [backendThemeName, setTheme])
-}

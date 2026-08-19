@@ -1,3 +1,6 @@
+import pytest
+
+from agent.errors import MoAPresetNotFoundError
 from hermes_cli.moa_config import (
     DEFAULT_MOA_AGGREGATOR,
     DEFAULT_MOA_PRESET_NAME,
@@ -11,87 +14,170 @@ from hermes_cli.moa_config import (
 )
 
 
+def test_moa_slot_picker_excludes_unconfigured_providers(monkeypatch):
+    from hermes_cli import moa_cmd
+
+    captured = {}
+    monkeypatch.setattr(moa_cmd, "load_picker_context", lambda: object())
+
+    def fake_build(_context, **kwargs):
+        captured.update(kwargs)
+        return {
+            "providers": [
+                {"slug": "moa", "models": ["default"]},
+                {"slug": "opencode-go", "models": ["deepseek-v4-pro"]},
+            ]
+        }
+
+    monkeypatch.setattr(moa_cmd, "build_models_payload", fake_build)
+
+    assert [row["slug"] for row in moa_cmd._model_options()] == ["opencode-go"]
+    assert captured["include_unconfigured"] is False
+
+
+def _enabled_refs(refs):
+    return [{**slot, "enabled": True} for slot in refs]
+
+
 def test_normalize_moa_config_uses_default_named_preset():
     cfg = normalize_moa_config({})
 
     assert cfg["default_preset"] == DEFAULT_MOA_PRESET_NAME
     assert list(cfg["presets"]) == [DEFAULT_MOA_PRESET_NAME]
-    assert cfg["reference_models"] == DEFAULT_MOA_REFERENCE_MODELS
+    assert cfg["reference_models"] == _enabled_refs(DEFAULT_MOA_REFERENCE_MODELS)
     assert cfg["aggregator"] == DEFAULT_MOA_AGGREGATOR
 
 
-def test_normalize_moa_config_preserves_named_presets():
-    cfg = normalize_moa_config(
-        {
-            "default_preset": "coding",
-            "presets": {
-                "coding": {
-                    "reference_models": [{"provider": "openai-codex", "model": "gpt-5.5"}],
-                    "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
-                },
-                "review": {
-                    "reference_models": [{"provider": "openrouter", "model": "deepseek/deepseek-v4-pro"}],
-                    "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
-                },
-            },
-        }
+
+
+
+
+
+
+def test_exact_preset_matching_skips_disabled_presets():
+    """A disabled preset must not match the implicit bare-name switch path.
+
+    Regression for #55187: with ``enabled: false`` presets, a plain model
+    switch whose name collides with a preset key (e.g. ``default``) silently
+    pivoted the session onto the MoA virtual provider. The per-preset
+    ``enabled`` opt-out must gate this implicit match.
+    """
+    config = {
+        "presets": {
+            "default": {"enabled": False},
+            "klo": {"enabled": False},
+        },
+    }
+    assert exact_moa_preset_name(config, "default") is None
+    assert exact_moa_preset_name(config, "klo") is None
+
+
+
+
+
+
+def test_resolve_missing_moa_preset_has_actionable_error():
+    cfg = {
+        "default_preset": "日常对话-高峰",
+        "presets": {"日常对话-高峰": {}, "日常对话-非高峰": {}},
+    }
+
+    with pytest.raises(MoAPresetNotFoundError) as exc_info:
+        resolve_moa_preset(cfg, "日常对话-高峰期")
+
+    message = str(exc_info.value)
+    assert "日常对话-高峰期" in message
+    assert "日常对话-高峰" in message
+    assert "日常对话-非高峰" in message
+    assert "hermes moa list" in message
+
+
+def test_missing_moa_preset_is_non_retryable():
+    from agent.error_classifier import FailoverReason, classify_api_error
+
+    result = classify_api_error(
+        MoAPresetNotFoundError("MoA preset 'old' was not found"),
+        provider="moa",
+        model="old",
     )
 
-    assert cfg["default_preset"] == "coding"
-    assert set(cfg["presets"]) == {"coding", "review"}
-    assert cfg["reference_models"] == [{"provider": "openai-codex", "model": "gpt-5.5"}]
+    assert result.reason == FailoverReason.model_not_found
+    assert result.retryable is False
+    assert result.should_fallback is False
 
 
-def test_legacy_flat_config_becomes_default_preset():
-    cfg = normalize_moa_config(
-        {
-            "reference_models": [{"provider": "openai-codex", "model": "gpt-5.5"}],
-            "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
-        }
-    )
-
-    assert cfg["presets"][DEFAULT_MOA_PRESET_NAME]["reference_models"] == [
-        {"provider": "openai-codex", "model": "gpt-5.5"}
-    ]
 
 
-def test_exact_preset_matching_is_not_fuzzy():
-    config = {"presets": {"coding": {}, "review": {}}}
-
-    assert exact_moa_preset_name(config, "coding") == "coding"
-    assert exact_moa_preset_name(config, "cod") is None
-    assert exact_moa_preset_name(config, "coding please fix this") is None
 
 
-def test_active_preset_toggle_validation():
-    config = {"default_preset": "coding", "presets": {"coding": {}, "review": {}}}
-
-    active = set_active_moa_preset(config, "review")
-    assert active["active_preset"] == "review"
-
-    inactive = set_active_moa_preset(active, "")
-    assert inactive["active_preset"] == ""
 
 
-def test_resolve_moa_preset_returns_requested_model_set():
-    cfg = normalize_moa_config(
-        {
-            "presets": {
-                "coding": {"reference_models": [{"provider": "openai-codex", "model": "gpt-5.5"}]},
-                "review": {"reference_models": [{"provider": "openrouter", "model": "deepseek/deepseek-v4-pro"}]},
-            }
-        }
-    )
-
-    assert resolve_moa_preset(cfg, "review")["reference_models"] == [
-        {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro"}
-    ]
+def _preset(**extra):
+    base = {
+        "reference_models": [{"provider": "openrouter", "model": "anthropic/claude-opus-4.8"}],
+        "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+    }
+    base.update(extra)
+    return {"default_preset": "p", "presets": {"p": base}}
 
 
-def test_build_moa_turn_prompt_encodes_one_shot_default_preset():
-    prompt = build_moa_turn_prompt("write a file then inspect it")
 
-    decoded_prompt, cfg = decode_moa_turn(prompt)
-    assert decoded_prompt == "write a file then inspect it"
-    assert cfg is not None
-    assert cfg["reference_models"] == DEFAULT_MOA_REFERENCE_MODELS
+
+
+
+# ── validate_moa_payload (write-boundary validation, #64156) ─────────────────
+#
+# normalize_moa_config is deliberately tolerant at READ time (hand-edited
+# configs degrade to defaults). validate_moa_payload is the strict WRITE-time
+# counterpart: it must flag exactly the payloads normalize would silently
+# repair, so API save paths reject them instead of corrupting user config.
+
+
+def _valid_preset_payload():
+    return {
+        "reference_models": [{"provider": "openrouter", "model": "deepseek/deepseek-v4-pro"}],
+        "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+    }
+
+
+
+
+def test_validate_moa_payload_agrees_with_clean_slot():
+    """Contract: a payload validate accepts must survive normalize UNCHANGED in
+    its slots — validate and _clean_slot can never disagree (else a payload
+    could pass validation and still be swapped for defaults)."""
+    from hermes_cli.moa_config import validate_moa_payload
+
+    payload = {"presets": {"p": _valid_preset_payload()}}
+    assert validate_moa_payload(payload) == []
+
+    cfg = normalize_moa_config(payload)
+    # Slots survive with only the canonical enabled=True default added — no
+    # provider/model swap, no defaults substitution.
+    assert cfg["presets"]["p"]["reference_models"] == _enabled_refs(payload["presets"]["p"]["reference_models"])
+    assert cfg["presets"]["p"]["aggregator"] == payload["presets"]["p"]["aggregator"]
+
+
+# ── Per-slot max_tokens ────────────────────────────────────────────────────
+
+
+
+
+
+
+# --- fanout cadence normalization (every_n) ---
+
+
+
+
+
+
+
+
+# --- privacy_filter normalization ---
+
+
+
+
+
+

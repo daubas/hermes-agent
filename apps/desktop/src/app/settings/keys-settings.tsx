@@ -1,12 +1,16 @@
+import { useStore } from '@nanostores/react'
 import { useEffect, useMemo, useState } from 'react'
 
 import { useI18n } from '@/i18n'
+import { $settingsScopeOverride } from '@/store/settings-scope'
 import type { EnvVarInfo } from '@/types/hermes'
 
 import { CredentialKeyCard, credentialPlaceholder, credentialRowLabel } from './credential-key-ui'
 import { useEnvCredentials } from './env-credentials'
 import { asText } from './helpers'
-import { LoadingState, SettingsContent } from './primitives'
+import { SettingsContent, SettingsSkeleton } from './primitives'
+import { SettingsProfileScope } from './profile-scope'
+import { useDeepLinkHighlight } from './use-deep-link-highlight'
 
 // Sub-views surfaced as sidebar subnav under Tools & Keys (see settings/index.tsx).
 export const KEYS_VIEWS = ['tools', 'settings'] as const
@@ -29,12 +33,25 @@ const VIEW_CATEGORIES: Record<KeysView, readonly string[]> = {
 
 export function KeysSettings({ view }: KeysSettingsProps) {
   const { t } = useI18n()
-  const { rowProps, vars } = useEnvCredentials()
+  // Shared settings "Applies to" scope: fetch + edit the selected profile's
+  // env store instead of the active one (null → active, the default path).
+  const scopeProfile = useStore($settingsScopeOverride)
+  const { rowProps, vars } = useEnvCredentials(scopeProfile)
   const [openKey, setOpenKey] = useState<null | string>(null)
 
   useEffect(() => {
     setOpenKey(null)
-  }, [view])
+  }, [scopeProfile, view])
+
+  // Deep link from Capabilities env-var rows (?tab=keys&key=<ENV_KEY>): scroll
+  // the credential card into view, flash it, and expand it. Same mechanism the
+  // command palette uses for config fields / archived sessions.
+  useDeepLinkHighlight({
+    elementId: key => `credential-key-${key}`,
+    onResolve: key => setOpenKey(key),
+    param: 'key',
+    ready: key => Boolean(vars && key in vars)
+  })
 
   const groups = useMemo(() => {
     if (!vars) {
@@ -53,30 +70,32 @@ export function KeysSettings({ view }: KeysSettingsProps) {
   }, [vars])
 
   if (!vars) {
-    return <LoadingState label={t.settings.keys.loading} />
+    return <SettingsSkeleton sections={[{ rows: 5 }]} />
   }
 
   const visible = groups.filter(g => g.category === view)
 
   return (
     <SettingsContent>
+      <SettingsProfileScope className="mb-5" />
       {visible.map(group => (
         <div className="grid gap-2" key={group.category}>
           {group.entries.map(([key, info]: [string, EnvVarInfo]) => {
             const label = credentialRowLabel(key, info)
 
             return (
-              <CredentialKeyCard
-                expanded={openKey === key}
-                info={info}
-                key={key}
-                label={label}
-                onExpand={() => setOpenKey(key)}
-                onToggle={() => setOpenKey(prev => (prev === key ? null : key))}
-                placeholder={credentialPlaceholder(key, info, label)}
-                rowProps={rowProps}
-                varKey={key}
-              />
+              <div className="scroll-mt-6 rounded-[6px]" id={`credential-key-${key}`} key={key}>
+                <CredentialKeyCard
+                  expanded={openKey === key}
+                  info={info}
+                  label={label}
+                  onExpand={() => setOpenKey(key)}
+                  onToggle={() => setOpenKey(prev => (prev === key ? null : key))}
+                  placeholder={credentialPlaceholder(key, info, label)}
+                  rowProps={rowProps}
+                  varKey={key}
+                />
+              </div>
             )
           })}
         </div>

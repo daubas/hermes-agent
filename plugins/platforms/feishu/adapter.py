@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import concurrent.futures
 import hashlib
 import hmac
 import itertools
@@ -84,45 +85,35 @@ try:
 except ImportError:
     websockets = None  # type: ignore[assignment]
 
-try:
-    import lark_oapi as lark
-    from lark_oapi.api.application.v6 import GetApplicationRequest
-    from lark_oapi.api.im.v1 import (
-        CreateFileRequest,
-        CreateFileRequestBody,
-        CreateImageRequest,
-        CreateImageRequestBody,
-        CreateMessageRequest,
-        CreateMessageRequestBody,
-        GetChatRequest,
-        GetMessageRequest,
-        GetMessageResourceRequest,
-        P2ImMessageMessageReadV1,
-        ReplyMessageRequest,
-        ReplyMessageRequestBody,
-        UpdateMessageRequest,
-        UpdateMessageRequestBody,
-    )
-    from lark_oapi.core import AccessTokenType, HttpMethod
-    from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
-    from lark_oapi.core.model import BaseRequest
-    from lark_oapi.event.callback.model.p2_card_action_trigger import (
-        CallBackCard,
-        P2CardActionTriggerResponse,
-    )
-    from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
-    from lark_oapi.ws import Client as FeishuWSClient
-
-    FEISHU_AVAILABLE = True
-except ImportError:
-    FEISHU_AVAILABLE = False
-    lark = None  # type: ignore[assignment]
-    CallBackCard = None  # type: ignore[assignment]
-    P2CardActionTriggerResponse = None  # type: ignore[assignment]
-    EventDispatcherHandler = None  # type: ignore[assignment]
-    FeishuWSClient = None  # type: ignore[assignment]
-    FEISHU_DOMAIN = None  # type: ignore[assignment]
-    LARK_DOMAIN = None  # type: ignore[assignment]
+# lark_oapi takes a noticeable amount of time to import.  Keep the gateway
+# configuration path responsive by importing it only when Feishu connects.
+lark = None  # type: ignore[assignment]
+GetApplicationRequest = None  # type: ignore[assignment]
+CreateFileRequest = None  # type: ignore[assignment]
+CreateFileRequestBody = None  # type: ignore[assignment]
+CreateImageRequest = None  # type: ignore[assignment]
+CreateImageRequestBody = None  # type: ignore[assignment]
+CreateMessageRequest = None  # type: ignore[assignment]
+CreateMessageRequestBody = None  # type: ignore[assignment]
+GetChatRequest = None  # type: ignore[assignment]
+GetMessageRequest = None  # type: ignore[assignment]
+GetMessageResourceRequest = None  # type: ignore[assignment]
+P2ImMessageMessageReadV1 = None  # type: ignore[assignment]
+ReplyMessageRequest = None  # type: ignore[assignment]
+ReplyMessageRequestBody = None  # type: ignore[assignment]
+UpdateMessageRequest = None  # type: ignore[assignment]
+UpdateMessageRequestBody = None  # type: ignore[assignment]
+AccessTokenType = None  # type: ignore[assignment]
+HttpMethod = None  # type: ignore[assignment]
+FEISHU_DOMAIN = None  # type: ignore[assignment]
+LARK_DOMAIN = None  # type: ignore[assignment]
+BaseRequest = None  # type: ignore[assignment]
+CallBackCard = None  # type: ignore[assignment]
+P2CardActionTriggerResponse = None  # type: ignore[assignment]
+EventDispatcherHandler = None  # type: ignore[assignment]
+FeishuWSClient = None  # type: ignore[assignment]
+FEISHU_AVAILABLE = False
+_lark_import_lock = threading.Lock()
 
 FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
@@ -144,6 +135,30 @@ from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write, env_float, env_int
 
+from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+from agent.secret_scope import get_secret as _scoped_get_secret
+
+
+def _get_scoped_secret(name, default=None):
+    """Scope-aware credential read with the default-profile startup fallback.
+
+    Secondary profiles construct their adapters under a profile secret
+    scope -- the scope is authoritative and a scoped miss returns ``default``
+    (no cross-profile borrow from ``os.environ``, which may hold another
+    profile's value). The DEFAULT profile's adapter constructs and sends
+    *unscoped* under multiplexing, where a bare ``get_secret`` would raise
+    ``UnscopedSecretError`` and crash this path; there ``os.environ`` is that
+    profile's own value, so fall back to it. Same pattern as the Slack
+    ``SLACK_APP_TOKEN`` read (#59739) and
+    ``gateway/platforms/whatsapp_common.py::_get_wsecret``.
+    """
+    try:
+        val = _scoped_get_secret(name, default)
+    except _UnscopedSecretError:
+        val = os.getenv(name)
+    return val if val is not None else default
+
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -151,11 +166,24 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _MARKDOWN_HINT_RE = re.compile(
-    r"(^#{1,6}\s)|(^\s*[-*]\s)|(^\s*\d+\.\s)|(^\s*---+\s*$)|(```)|(`[^`\n]+`)|(\*\*[^*\n].+?\*\*)|(~~[^~\n].+?~~)|(<u>.+?</u>)|(\*[^*\n]+\*)|(\[[^\]]+\]\([^)]+\))|(^>\s)",
+    # Pipe table: any header line + separator line both starting with '|'.
+    r"(^\|.*\|\s*\n\|[-:|\s]+\|)"
+    # Headings, lists, code, bold/italic/strike/underline, links, blockquotes.
+    r"|(^#{1,6}\s)"
+    r"|(^\s*[-*]\s)"
+    r"|(^\s*\d+\.\s)"
+    r"|(^\s*---+\s*$)"
+    r"|(```)"
+    r"|(`[^`\n]+`)"
+    r"|(\*\*[^*\n].+?\*\*)"
+    r"|(~~[^~\n].+?~~)"
+    r"|(<u>.+?</u>)"
+    r"|(\*[^*\n]+\*)"
+    r"|(\[[^\]]+\]\([^)]+\))"
+    r"|(^>\s)",
     re.MULTILINE,
 )
-# Detect markdown tables: a line starting with | followed by a separator line.
-# Feishu post-type 'md' elements do not render tables, so we force text mode.
+# Backwards-compatible alias retained because external callers reference it.
 _MARKDOWN_TABLE_RE = re.compile(r"^\|.*\|\n\|[-|: ]+\|", re.MULTILINE)
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
@@ -227,6 +255,19 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
     "always": "Approved permanently",
     "deny": "Denied",
 }
+
+
+async def _read_limited_feishu_webhook_body(request: Any, max_bytes: int) -> bytes:
+    """Read at most ``max_bytes`` from an aiohttp request body."""
+    try:
+        body = await request.content.readexactly(max_bytes + 1)
+    except asyncio.IncompleteReadError as exc:
+        body = exc.partial
+    if len(body) > max_bytes:
+        raise ValueError("payload too large")
+    return body
+
+
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 
@@ -1344,36 +1385,38 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
         adapter._ws_thread_loop = None
 
 
-def check_feishu_requirements() -> bool:
-    """Check if Feishu/Lark dependencies are available.
-
-    Lazy-installs lark-oapi via ``tools.lazy_deps.ensure("platform.feishu")``
-    on first call if not present. Rebinds all module-level globals on success.
-    """
+def _load_lark_oapi() -> bool:
+    """Import and bind the Feishu SDK after an explicit connection request."""
     if FEISHU_AVAILABLE:
         return True
 
-    def _import():
-        import lark_oapi as lark
-        from lark_oapi.api.application.v6 import GetApplicationRequest
-        from lark_oapi.api.im.v1 import (
-            CreateFileRequest, CreateFileRequestBody,
-            CreateImageRequest, CreateImageRequestBody,
-            CreateMessageRequest, CreateMessageRequestBody,
-            GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
-            P2ImMessageMessageReadV1,
-            ReplyMessageRequest, ReplyMessageRequestBody,
-            UpdateMessageRequest, UpdateMessageRequestBody,
-        )
-        from lark_oapi.core import AccessTokenType, HttpMethod
-        from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
-        from lark_oapi.core.model import BaseRequest
-        from lark_oapi.event.callback.model.p2_card_action_trigger import (
-            CallBackCard, P2CardActionTriggerResponse,
-        )
-        from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
-        from lark_oapi.ws import Client as FeishuWSClient
-        return {
+    with _lark_import_lock:
+        if FEISHU_AVAILABLE:
+            return True
+        try:
+            import lark_oapi as lark
+            from lark_oapi.api.application.v6 import GetApplicationRequest
+            from lark_oapi.api.im.v1 import (
+                CreateFileRequest, CreateFileRequestBody,
+                CreateImageRequest, CreateImageRequestBody,
+                CreateMessageRequest, CreateMessageRequestBody,
+                GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
+                P2ImMessageMessageReadV1,
+                ReplyMessageRequest, ReplyMessageRequestBody,
+                UpdateMessageRequest, UpdateMessageRequestBody,
+            )
+            from lark_oapi.core import AccessTokenType, HttpMethod
+            from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
+            from lark_oapi.core.model import BaseRequest
+            from lark_oapi.event.callback.model.p2_card_action_trigger import (
+                CallBackCard, P2CardActionTriggerResponse,
+            )
+            from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
+            from lark_oapi.ws import Client as FeishuWSClient
+        except ImportError:
+            return False
+
+        globals().update({
             "lark": lark,
             "GetApplicationRequest": GetApplicationRequest,
             "CreateFileRequest": CreateFileRequest,
@@ -1400,10 +1443,42 @@ def check_feishu_requirements() -> bool:
             "EventDispatcherHandler": EventDispatcherHandler,
             "FeishuWSClient": FeishuWSClient,
             "FEISHU_AVAILABLE": True,
-        }
+        })
+        return True
 
-    from tools.lazy_deps import ensure_and_bind
-    return ensure_and_bind("platform.feishu", _import, globals(), prompt=False)
+
+def feishu_deps_present() -> bool:
+    """PASSIVE probe: is lark-oapi installed right now?
+
+    Registry ``check_fn`` — called from status displays and config loading,
+    so it must never install anything.  Uses ``is_available`` (cheap
+    importlib.metadata lookups) instead of importing the SDK, which is
+    deferred to ``_load_lark_oapi`` at connect time.  The ACTIVE
+    lazy-installer (``check_feishu_requirements``) is registered as
+    ``ensure_deps_fn`` and runs from ``create_adapter()`` when this
+    returns False (#79812).
+    """
+    if FEISHU_AVAILABLE:
+        return True
+    try:
+        from tools.lazy_deps import is_available
+        return is_available("platform.feishu")
+    except Exception:  # pragma: no cover — defensive
+        return False
+
+
+def check_feishu_requirements() -> bool:
+    """Ensure Feishu dependencies are installed without importing the SDK."""
+    if FEISHU_AVAILABLE:
+        return True
+
+    from tools.lazy_deps import ensure
+
+    try:
+        ensure("platform.feishu", prompt=False)
+        return True
+    except Exception:
+        return False
 
 
 class FeishuAdapter(BasePlatformAdapter):
@@ -1430,6 +1505,16 @@ class FeishuAdapter(BasePlatformAdapter):
         self._settings = self._load_settings(config.extra or {})
         self._apply_settings(self._settings)
         self._client: Optional[Any] = None
+        # Adapter-owned thread pool for blocking Feishu SDK calls. Routing SDK
+        # work through this pool (instead of asyncio's shared default executor)
+        # means a torn-down default executor can no longer wedge sends with
+        # "Executor shutdown has been called" — the pool is recreated on demand
+        # if it has been shut down. See issue #10849.
+        self._sdk_executor_lock = threading.Lock()
+        self._sdk_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        # Set on disconnect/shutdown so a real teardown can't be resurrected
+        # by the recreate-on-shutdown path; cleared on connect for reconnects.
+        self._sdk_executor_closing = False
         self._ws_client: Optional[Any] = None
         self._ws_future: Optional[asyncio.Future] = None
         self._ws_thread_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -1516,14 +1601,14 @@ class FeishuAdapter(BasePlatformAdapter):
 
         return FeishuAdapterSettings(
             app_id=str(extra.get("app_id") or os.getenv("FEISHU_APP_ID", "")).strip(),
-            app_secret=str(extra.get("app_secret") or os.getenv("FEISHU_APP_SECRET", "")).strip(),
+            app_secret=str(extra.get("app_secret") or _get_scoped_secret("FEISHU_APP_SECRET", "")).strip(),
             domain_name=str(extra.get("domain") or os.getenv("FEISHU_DOMAIN", "feishu")).strip().lower(),
             connection_mode=str(
                 extra.get("connection_mode") or os.getenv("FEISHU_CONNECTION_MODE", "websocket")
             ).strip().lower(),
-            encrypt_key=str(extra.get("encrypt_key") or os.getenv("FEISHU_ENCRYPT_KEY", "")).strip(),
+            encrypt_key=str(extra.get("encrypt_key") or _get_scoped_secret("FEISHU_ENCRYPT_KEY", "")).strip(),
             verification_token=str(
-                extra.get("verification_token") or os.getenv("FEISHU_VERIFICATION_TOKEN", "")
+                extra.get("verification_token") or _get_scoped_secret("FEISHU_VERIFICATION_TOKEN", "")
             ).strip(),
             group_policy=os.getenv("FEISHU_GROUP_POLICY", "allowlist").strip().lower(),
             allowed_group_users=frozenset(
@@ -1641,11 +1726,56 @@ class FeishuAdapter(BasePlatformAdapter):
             .build()
         )
 
-    async def connect(self) -> bool:
+    def _get_sdk_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        """Return the adapter-owned executor for blocking Feishu SDK calls.
+
+        Recreates the pool if it was never built or was shut down by an
+        *external* teardown of the loop's default executor, so that can no
+        longer permanently wedge sends (#10849). Refuses to resurrect once
+        the adapter itself is closing — a real disconnect/shutdown stays shut.
+        """
+        lock = getattr(self, "_sdk_executor_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._sdk_executor_lock = lock
+        with lock:
+            if getattr(self, "_sdk_executor_closing", False):
+                raise RuntimeError("Feishu adapter is shutting down; SDK executor unavailable")
+            executor = getattr(self, "_sdk_executor", None)
+            if executor is None or getattr(executor, "_shutdown", False):
+                executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=10,
+                    thread_name_prefix="hermes-feishu-sdk",
+                )
+                self._sdk_executor = executor
+            return executor
+
+    async def _run_blocking(self, func, *args):
+        """Run a blocking Feishu SDK call on the adapter-owned thread pool."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._get_sdk_executor(), func, *args)
+
+    def _shutdown_sdk_executor(self) -> None:
+        """Stop the adapter-owned SDK executor without touching the loop default."""
+        lock = getattr(self, "_sdk_executor_lock", None)
+        if lock is None:
+            return
+        with lock:
+            self._sdk_executor_closing = True
+            executor = getattr(self, "_sdk_executor", None)
+            self._sdk_executor = None
+        if executor is None:
+            return
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=False)
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Feishu/Lark."""
-        if not FEISHU_AVAILABLE:
-            logger.error("[Feishu] lark-oapi not installed")
-            return False
+        # A fresh connect (or reconnect) re-arms the SDK executor after a prior
+        # disconnect set the closing flag.
+        self._sdk_executor_closing = False
         if not self._app_id or not self._app_secret:
             logger.error("[Feishu] FEISHU_APP_ID or FEISHU_APP_SECRET not set")
             return False
@@ -1659,6 +1789,9 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error(
                 "[Feishu] Webhook mode requires FEISHU_VERIFICATION_TOKEN or FEISHU_ENCRYPT_KEY."
             )
+            return False
+        if not await asyncio.to_thread(_load_lark_oapi):
+            logger.error("[Feishu] lark-oapi not installed")
             return False
 
         try:
@@ -1697,10 +1830,49 @@ class FeishuAdapter(BasePlatformAdapter):
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
         self._reset_batch_buffers()
+
+        # Send a WebSocket CLOSE frame to Feishu BEFORE tearing down the
+        # thread loop. Without this, Feishu's server never learns the
+        # connection is dead and continues routing messages to the stale
+        # endpoint — the channel goes silent until the server-side
+        # CLOSE-WAIT expires (minutes to hours). See issue #10202.
+        #
+        # ``_disable_websocket_auto_reconnect()`` nils ``self._ws_client``,
+        # so capture the client reference first.
+        ws_client = self._ws_client
+        ws_thread_loop = self._ws_thread_loop
         self._disable_websocket_auto_reconnect()
         await self._stop_webhook_server()
 
-        ws_thread_loop = self._ws_thread_loop
+        if (
+            ws_client is not None
+            and ws_thread_loop is not None
+            and not ws_thread_loop.is_closed()
+            and hasattr(ws_client, "_disconnect")
+        ):
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    ws_client._disconnect(), ws_thread_loop
+                )
+                # 5s is generous — the CLOSE frame is a single WebSocket
+                # control frame. If it takes longer than that the
+                # connection is already wedged and we gain nothing by
+                # waiting further.
+                await asyncio.wait_for(asyncio.wrap_future(future), timeout=5.0)
+                logger.debug("[Feishu] Sent WebSocket CLOSE frame to Feishu")
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[Feishu] CLOSE frame not acknowledged within 5s — "
+                    "Feishu may briefly route messages to the stale "
+                    "connection until server-side timeout"
+                )
+            except Exception as exc:
+                logger.debug(
+                    "[Feishu] Could not send WebSocket CLOSE frame: %s",
+                    exc,
+                    exc_info=True,
+                )
+
         if ws_thread_loop is not None and not ws_thread_loop.is_closed():
             logger.debug("[Feishu] Cancelling websocket thread tasks and stopping loop")
 
@@ -1730,6 +1902,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_thread_loop = None
         self._loop = None
         self._event_handler = None
+        self._shutdown_sdk_executor()
         self._persist_seen_message_ids()
         await self._release_app_lock()
 
@@ -1785,11 +1958,21 @@ class FeishuAdapter(BasePlatformAdapter):
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        # When chunking splits a long markdown response, an individual chunk
+        # can end up as plain prose that doesn't match the per-chunk hint
+        # regex — so it would be sent as ``msg_type=text`` and the user would
+        # see literal ``**bold``/``## heading``/code fences in the Feishu
+        # client while other chunks render correctly. Lock the markdown
+        # decision at the whole-message level so every chunk consistently
+        # uses ``post``. See #26841.
+        prefer_post = bool(_MARKDOWN_HINT_RE.search(formatted))
         last_response = None
 
         try:
             for chunk in chunks:
-                msg_type, payload = self._build_outbound_payload(chunk)
+                msg_type, payload = self._build_outbound_payload(
+                    chunk, prefer_post=prefer_post,
+                )
                 try:
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
@@ -1846,7 +2029,7 @@ class FeishuAdapter(BasePlatformAdapter):
             msg_type, payload = self._build_outbound_payload(content)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
-            response = await asyncio.to_thread(self._client.im.v1.message.update, request)
+            response = await self._run_blocking(self._client.im.v1.message.update, request)
             result = self._finalize_send_result(response, "update failed")
             if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
                 logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
@@ -1855,7 +2038,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
                 )
                 fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
-                fallback_response = await asyncio.to_thread(self._client.im.v1.message.update, fallback_request)
+                fallback_response = await self._run_blocking(self._client.im.v1.message.update, fallback_request)
                 result = self._finalize_send_result(fallback_response, "update failed")
             if result.success:
                 result.message_id = message_id
@@ -1864,10 +2047,20 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    # Template attrs for the shared _format_exec_approval core. The card
+    # header carries the title, so the text core starts at the code fence.
+    _EA_HEADER = ""
+    _EA_REASON_LABEL = "**Reason:** "
+    _EA_SMART_DENY_LINE = "\n\n**Smart DENY:** owner override applies to this one operation only."
+    _EA_CMD_BUDGET = 3000
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+        smart_denied: bool = False,
     ) -> SendResult:
         """Send an interactive card with approval buttons.
 
@@ -1880,7 +2073,6 @@ class FeishuAdapter(BasePlatformAdapter):
 
         try:
             approval_id = next(self._approval_counter)
-            cmd_preview = command[:3000] + "..." if len(command) > 3000 else command
 
             def _btn(label: str, action_name: str, btn_type: str = "default") -> dict:
                 return {
@@ -1890,6 +2082,12 @@ class FeishuAdapter(BasePlatformAdapter):
                     "value": {"hermes_action": action_name, "approval_id": approval_id},
                 }
 
+            actions = [_btn("✅ Allow Once", "approve_once", "primary")]
+            if not smart_denied and allow_session:
+                actions.append(_btn("✅ Session", "approve_session"))
+                if allow_permanent:
+                    actions.append(_btn("✅ Always", "approve_always"))
+            actions.append(_btn("❌ Deny", "deny", "danger"))
             card = {
                 "config": {"wide_screen_mode": True},
                 "header": {
@@ -1899,16 +2097,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 "elements": [
                     {
                         "tag": "markdown",
-                        "content": f"```\n{cmd_preview}\n```\n**Reason:** {description}",
+                        "content": self._format_exec_approval(command, description, smart_denied),
                     },
                     {
                         "tag": "action",
-                        "actions": [
-                            _btn("✅ Allow Once", "approve_once", "primary"),
-                            _btn("✅ Session", "approve_session"),
-                            _btn("✅ Always", "approve_always"),
-                            _btn("❌ Deny", "deny", "danger"),
-                        ],
+                        "actions": actions,
                     },
                 ],
             }
@@ -2040,7 +2233,7 @@ class FeishuAdapter(BasePlatformAdapter):
     def _write_update_prompt_response(answer: str) -> None:
         response_path = get_hermes_home() / ".update_response"
         tmp_path = response_path.with_suffix(".tmp")
-        tmp_path.write_text(answer)
+        tmp_path.write_text(answer, encoding="utf-8")
         tmp_path.replace(response_path)
 
     async def send_voice(
@@ -2128,7 +2321,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 image=image_file,
             )
             request = self._build_image_upload_request(body)
-            upload_response = await asyncio.to_thread(self._client.im.v1.image.create, request)
+            upload_response = await self._run_blocking(self._client.im.v1.image.create, request)
             image_key = self._extract_response_field(upload_response, "image_key")
             if not image_key:
                 return self._response_error_result(
@@ -2244,7 +2437,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         try:
             request = self._build_get_chat_request(chat_id)
-            response = await asyncio.to_thread(self._client.im.v1.chat.get, request)
+            response = await self._run_blocking(self._client.im.v1.chat.get, request)
             if not response or getattr(response, "success", lambda: False)() is False:
                 code = getattr(response, "code", "unknown")
                 msg = getattr(response, "msg", "chat lookup failed")
@@ -2733,6 +2926,22 @@ class FeishuAdapter(BasePlatformAdapter):
                 "Feishu button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                 count, state["session_key"], choice, user_name,
             )
+            if not count and choice != "deny":
+                # The card was already updated synchronously to "Approved" by
+                # the callback response, but nothing was waiting — the wait
+                # already timed out (fail-closed deny) or was resolved via
+                # /approve. Correct the record so the user doesn't believe
+                # the command ran.
+                _chat = str(state.get("chat_id", "") or chat_id or "")
+                if _chat:
+                    try:
+                        await self.send(
+                            _chat,
+                            "⌛ That approval had already expired — the command "
+                            "was not run (it timed out or was resolved elsewhere).",
+                        )
+                    except Exception:
+                        logger.debug("[Feishu] expired-approval notice failed", exc_info=True)
         except Exception as exc:
             logger.error("Failed to resolve gateway approval from Feishu button: %s", exc)
 
@@ -2789,7 +2998,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # Fetch the target message to verify it was sent by us and to obtain chat context.
         try:
             request = self._build_get_message_request(message_id)
-            response = await asyncio.to_thread(self._client.im.v1.message.get, request)
+            response = await self._run_blocking(self._client.im.v1.message.get, request)
             if not response or not getattr(response, "success", lambda: False)():
                 return
             items = getattr(getattr(response, "data", None), "items", None) or []
@@ -2832,6 +3041,7 @@ class FeishuAdapter(BasePlatformAdapter):
             source=source,
             raw_message=data,
             message_id=message_id,
+            channel_prompt=self._resolve_channel_prompt(chat_id),
             timestamp=datetime.now(),
         )
         logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
@@ -2894,6 +3104,7 @@ class FeishuAdapter(BasePlatformAdapter):
             source=source,
             raw_message=data,
             message_id=token or str(uuid.uuid4()),
+            channel_prompt=self._resolve_channel_prompt(chat_id),
             timestamp=datetime.now(),
         )
         logger.info("[Feishu] Routing card action %r from %s in %s as synthetic command", action_tag, open_id, chat_id)
@@ -2967,7 +3178,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 .request_body(body)
                 .build()
             )
-            response = await asyncio.to_thread(self._client.im.v1.message_reaction.create, request)
+            response = await self._run_blocking(self._client.im.v1.message_reaction.create, request)
             if response and getattr(response, "success", lambda: False)():
                 data = getattr(response, "data", None)
                 return getattr(data, "reaction_id", None)
@@ -2998,7 +3209,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 .reaction_id(reaction_id)
                 .build()
             )
-            response = await asyncio.to_thread(self._client.im.v1.message_reaction.delete, request)
+            response = await self._run_blocking(self._client.im.v1.message_reaction.delete, request)
             if response and getattr(response, "success", lambda: False)():
                 return True
             logger.debug(
@@ -3096,6 +3307,18 @@ class FeishuAdapter(BasePlatformAdapter):
     # Inbound processing pipeline
     # =========================================================================
 
+    def _resolve_channel_prompt(self, chat_id: str, parent_id: str | None = None) -> str | None:
+        """Resolve a Feishu per-channel system prompt.
+
+        Mirrors the Discord/Slack behaviour so ``channel_prompts: {<chat_id>:
+        "<prompt>"}`` in ``PlatformConfig.extra`` is honoured for Feishu chats
+        instead of being silently ignored.
+        """
+        from gateway.platforms.base import resolve_channel_prompt
+        _config = getattr(self, "config", None)
+        _extra = getattr(_config, "extra", None) or {}
+        return resolve_channel_prompt(_extra, chat_id, parent_id)
+
     async def _process_inbound_message(
         self,
         *,
@@ -3173,6 +3396,7 @@ class FeishuAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=reply_to_message_id,
             reply_to_text=reply_to_text,
+            channel_prompt=self._resolve_channel_prompt(chat_id, thread_id or None),
             timestamp=datetime.now(),
         )
         await self._dispatch_inbound_event(normalized)
@@ -3275,13 +3499,17 @@ class FeishuAdapter(BasePlatformAdapter):
         default_ext: str,
         preferred_name: str,
     ) -> tuple[str, str]:
-        from tools.url_safety import is_safe_url
+        from gateway.platforms.base import _ssrf_redirect_guard
+        from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
+
         if not is_safe_url(file_url):
             raise ValueError(f"Blocked unsafe URL (SSRF protection): {file_url[:80]}")
 
-        import httpx
-
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        async with create_ssrf_safe_async_client(
+            timeout=30.0,
+            follow_redirects=True,
+            event_hooks={"response": [_ssrf_redirect_guard]},
+        ) as client:
             response = await client.get(
                 file_url,
                 headers={
@@ -3353,9 +3581,16 @@ class FeishuAdapter(BasePlatformAdapter):
 
         try:
             body_bytes: bytes = await asyncio.wait_for(
-                request.read(),
+                _read_limited_feishu_webhook_body(
+                    request,
+                    _FEISHU_WEBHOOK_MAX_BODY_BYTES,
+                ),
                 timeout=_FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS,
             )
+        except ValueError:
+            logger.warning("[Feishu] Webhook body exceeds limit from %s", remote_ip)
+            self._record_webhook_anomaly(remote_ip, "413")
+            return web.Response(status=413, text="Request body too large")
         except asyncio.TimeoutError:
             logger.warning("[Feishu] Webhook body read timed out after %ds from %s", _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS, remote_ip)
             self._record_webhook_anomaly(remote_ip, "408")
@@ -3363,11 +3598,6 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception:
             self._record_webhook_anomaly(remote_ip, "400")
             return web.json_response({"code": 400, "msg": "failed to read body"}, status=400)
-
-        if len(body_bytes) > _FEISHU_WEBHOOK_MAX_BODY_BYTES:
-            logger.warning("[Feishu] Webhook body exceeds limit (%d bytes) from %s", len(body_bytes), remote_ip)
-            self._record_webhook_anomaly(remote_ip, "413")
-            return web.Response(status=413, text="Request body too large")
 
         try:
             payload = json.loads(body_bytes.decode("utf-8"))
@@ -3379,7 +3609,11 @@ class FeishuAdapter(BasePlatformAdapter):
         if self._verification_token:
             header = payload.get("header") or {}
             incoming_token = str(header.get("token") or payload.get("token") or "")
-            if not incoming_token or not hmac.compare_digest(incoming_token, self._verification_token):
+            # Compare as bytes: compare_digest raises TypeError on a str with
+            # non-ASCII characters, and the token comes from the request body.
+            if not incoming_token or not hmac.compare_digest(
+                incoming_token.encode(), self._verification_token.encode()
+            ):
                 logger.warning("[Feishu] Webhook rejected: invalid verification token from %s", remote_ip)
                 self._record_webhook_anomaly(remote_ip, "401-token")
                 return web.Response(status=401, text="Invalid verification token")
@@ -3442,7 +3676,9 @@ class FeishuAdapter(BasePlatformAdapter):
             body_str = body_bytes.decode("utf-8", errors="replace")
             content = f"{timestamp}{nonce}{self._encrypt_key}{body_str}"
             computed = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            return hmac.compare_digest(computed, signature)
+            # Compare as bytes: compare_digest raises TypeError on a str with
+            # non-ASCII characters, and the signature is a raw request header.
+            return hmac.compare_digest(computed.encode(), signature.encode())
         except Exception:
             logger.debug("[Feishu] Signature verification raised an exception", exc_info=True)
             return False
@@ -3475,9 +3711,16 @@ class FeishuAdapter(BasePlatformAdapter):
             ]
             for k in stale_keys:
                 del self._webhook_rate_counts[k]
-            # If still at capacity after pruning, allow through without tracking.
+            # If still at capacity after pruning, deny untracked keys (fail closed).
+            # The table only fills with this many distinct (account, endpoint, IP)
+            # triples under abuse; allowing untracked requests through at capacity
+            # would let an attacker who flooded the table bypass the limiter entirely.
             if rate_key not in self._webhook_rate_counts and len(self._webhook_rate_counts) >= _FEISHU_WEBHOOK_RATE_MAX_KEYS:
-                return True
+                logger.warning(
+                    "[Feishu] Webhook rate-limit table at capacity (%d keys) — denying untracked key",
+                    _FEISHU_WEBHOOK_RATE_MAX_KEYS,
+                )
+                return False
         self._webhook_rate_counts[rate_key] = (1, now)
         return True
 
@@ -3493,6 +3736,7 @@ class FeishuAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=event.source.profile,
         )
 
     @staticmethod
@@ -3683,7 +3927,15 @@ class FeishuAdapter(BasePlatformAdapter):
         if preferred == "photo":
             return self._resolve_media_message_type(media_types[0] if media_types else "", default=MessageType.PHOTO)
         if preferred == "audio":
-            return self._resolve_media_message_type(media_types[0] if media_types else "", default=MessageType.AUDIO)
+            # Lark's native "audio" msg_type is an in-app voice recording, not
+            # an uploaded audio file (those arrive as "file"/"media" and are
+            # normalized to "document"). Classify it as VOICE so the gateway
+            # auto-transcribes it (Opus → STT) the same way
+            # Discord/DingTalk/Telegram/etc. do — otherwise a Feishu voice note
+            # reaches the agent as an untranscribable AUDIO attachment and is
+            # silently ignored. Follow-up to #28993, which added native
+            # voice-note transcription for Discord + DingTalk.
+            return MessageType.VOICE
         if preferred == "document":
             return self._resolve_media_message_type(media_types[0] if media_types else "", default=MessageType.DOCUMENT)
         return MessageType.TEXT
@@ -3713,7 +3965,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 file_key=image_key,
                 resource_type="image",
             )
-            response = await asyncio.to_thread(self._client.im.v1.message_resource.get, request)
+            response = await self._run_blocking(self._client.im.v1.message_resource.get, request)
             if not response or not response.success():
                 logger.warning(
                     "[Feishu] Failed to download image %s: %s %s",
@@ -3757,7 +4009,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     file_key=file_key,
                     resource_type=request_type,
                 )
-                response = await asyncio.to_thread(self._client.im.v1.message_resource.get, request)
+                response = await self._run_blocking(self._client.im.v1.message_resource.get, request)
                 if not response or not response.success():
                     logger.debug(
                         "[Feishu] Resource download failed for %s/%s via type=%s: %s %s",
@@ -3975,7 +4227,7 @@ class FeishuAdapter(BasePlatformAdapter):
             else:
                 id_type = "user_id"
             request = GetUserRequest.builder().user_id(trimmed).user_id_type(id_type).build()
-            response = await asyncio.to_thread(self._client.contact.v3.user.get, request)
+            response = await self._run_blocking(self._client.contact.v3.user.get, request)
             if not response or not response.success():
                 return None
             user = getattr(getattr(response, "data", None), "user", None)
@@ -4006,7 +4258,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 .token_types({AccessTokenType.TENANT})
                 .build()
             )
-            resp = await asyncio.to_thread(self._client.request, req)
+            resp = await self._run_blocking(self._client.request, req)
             content = getattr(getattr(resp, "raw", None), "content", None)
             if not content:
                 return None
@@ -4031,7 +4283,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return self._message_text_cache[message_id]
         try:
             request = self._build_get_message_request(message_id)
-            response = await asyncio.to_thread(self._client.im.v1.message.get, request)
+            response = await self._run_blocking(self._client.im.v1.message.get, request)
             if not response or getattr(response, "success", lambda: False)() is False:
                 code = getattr(response, "code", "unknown")
                 msg = getattr(response, "msg", "message lookup failed")
@@ -4118,6 +4370,17 @@ class FeishuAdapter(BasePlatformAdapter):
                 return "bot_not_mentioned"
 
         if not is_group:
+            if os.getenv("FEISHU_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+                return None
+            if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
+                return None
+            # Empty FEISHU_ALLOWED_USERS is the pairing-mode default from setup:
+            # forward DMs to gateway intake so the pairing handshake can run.
+            # Gateway auth fail-closes agent access until approval.
+            if not self._allowed_group_users:
+                return None
+            if not (sender_ids and (sender_ids & self._allowed_group_users)):
+                return "dm_policy_rejected"
             return None
 
         if not self._allow_group_message(
@@ -4255,7 +4518,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 .token_types({AccessTokenType.TENANT})
                 .build()
             )
-            resp = await asyncio.to_thread(self._client.request, req)
+            resp = await self._run_blocking(self._client.request, req)
             content = getattr(getattr(resp, "raw", None), "content", None)
             if content:
                 payload = json.loads(content)
@@ -4287,7 +4550,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return
         try:
             request = self._build_get_application_request(app_id=self._app_id, lang="en_us")
-            response = await asyncio.to_thread(self._client.application.v6.application.get, request)
+            response = await self._run_blocking(self._client.application.v6.application.get, request)
             if not response or not response.success():
                 code = getattr(response, "code", None)
                 if code == 99991672:
@@ -4374,17 +4637,59 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound payload construction and send pipeline
     # =========================================================================
 
-    def _build_outbound_payload(self, content: str) -> tuple[str, str]:
-        # Feishu post-type 'md' elements do not render markdown tables; sending
-        # table content as post causes the message to appear blank on the client.
-        # Force plain text for anything that looks like a markdown table.
-        if _MARKDOWN_TABLE_RE.search(content):
-            text_payload = {"text": content}
-            return "text", json.dumps(text_payload, ensure_ascii=False)
-        if _MARKDOWN_HINT_RE.search(content):
+    def _build_outbound_payload(
+        self, content: str, *, prefer_post: bool = False,
+    ) -> tuple[str, str]:
+        # Empirically (issue #52786), current Feishu clients render markdown
+        # tables inside ``post``-type ``md`` elements natively. The previous
+        # table-downgrade branch forced any table-containing message to
+        # ``text``, which left Feishu readers seeing the raw pipe-and-dash
+        # source instead of a rendered table. Trust the common markdown path
+        # for table content too.
+        #
+        # ``prefer_post`` lets ``send`` treat the chunk as part of a larger
+        # markdown document: when a long markdown reply is split at
+        # MAX_MESSAGE_LENGTH, the per-chunk regex would otherwise
+        # mis-classify a plain-prose chunk as ``text``. See #26841.
+        if prefer_post or _MARKDOWN_HINT_RE.search(content):
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
+
+    @staticmethod
+    def _get_audio_duration_ms(file_path: str) -> int:
+        """Extract OGG/Opus audio duration in milliseconds (pure Python, no deps).
+
+        Parses the OGG container to find the last granule position and divides
+        by the Opus sample rate (48000 Hz). Returns 0 for non-OGG files or on error.
+        """
+        import struct
+        try:
+            with open(file_path, "rb") as f:
+                data = f.read()
+            pos = 0
+            last_granule = 0
+            while pos < len(data) - 27:
+                idx = data.find(b"OggS", pos)
+                if idx == -1:
+                    break
+                pos = idx
+                if pos + 27 > len(data):
+                    break
+                granule = struct.unpack_from("<q", data, pos + 6)[0]
+                num_segments = data[pos + 26]
+                if granule > 0:
+                    last_granule = granule
+                segment_end = pos + 27 + num_segments
+                if segment_end > len(data):
+                    break
+                page_size = num_segments
+                for i in range(num_segments):
+                    page_size += data[pos + 27 + i]
+                pos += page_size
+            return int(last_granule / 48000 * 1000) if last_granule > 0 else 0
+        except Exception:
+            return 0
 
     async def _send_uploaded_file_message(
         self,
@@ -4408,14 +4713,18 @@ class FeishuAdapter(BasePlatformAdapter):
             requested_message_type=outbound_message_type,
         )
         try:
+            duration_ms = 0
+            if upload_file_type == "opus":
+                duration_ms = self._get_audio_duration_ms(file_path)
             with open(file_path, "rb") as file_obj:
                 body = self._build_file_upload_body(
                     file_type=upload_file_type,
                     file_name=display_name,
                     file=file_obj,
+                    duration=duration_ms,
                 )
                 request = self._build_file_upload_request(body)
-                upload_response = await asyncio.to_thread(self._client.im.v1.file.create, request)
+                upload_response = await self._run_blocking(self._client.im.v1.file.create, request)
             file_key = self._extract_response_field(upload_response, "file_key")
             if not file_key:
                 return self._response_error_result(
@@ -4445,10 +4754,62 @@ class FeishuAdapter(BasePlatformAdapter):
                     reply_to=reply_to,
                     metadata=metadata,
                 )
+                # Audio messages may fail with 99992402 when using thread_id routing.
+                # Try replying to the last message in the thread, then fall back to chat_id.
+                if (not self._response_succeeded(message_response)
+                        and getattr(message_response, "code", None) == 99992402
+                        and resolved_message_type == "audio"
+                        and (metadata or {}).get("thread_id")):
+                    # Try reply API with thread_id as reply anchor
+                    thread_msg_id = (metadata or {}).get("reply_to_message_id")
+                    if not thread_msg_id:
+                        thread_msg_id = await self._fetch_last_message_in_thread(
+                            (metadata or {}).get("thread_id")
+                        )
+                    if thread_msg_id:
+                        logger.info("[Feishu] Audio: retrying via reply API in thread")
+                        message_response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type=resolved_message_type,
+                            payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
+                            reply_to=thread_msg_id,
+                            metadata=metadata,
+                        )
+                    if not self._response_succeeded(message_response):
+                        logger.warning("[Feishu] Audio send failed in thread, retrying with chat_id")
+                        message_response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type=resolved_message_type,
+                            payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
+                            reply_to=None,
+                            metadata=None,
+                        )
             return self._finalize_send_result(message_response, "file send failed")
         except Exception as exc:
             logger.error("[Feishu] Failed to send file %s: %s", file_path, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    async def _fetch_last_message_in_thread(self, thread_id: str) -> Optional[str]:
+        """Fetch the last message_id in a thread for reply-based routing."""
+        if not self._client or not thread_id:
+            return None
+        try:
+            from lark_oapi.api.im.v1 import ListMessageRequest
+            request = (
+                ListMessageRequest.builder()
+                .container_id_type("thread")
+                .container_id(thread_id)
+                .page_size(1)
+                .build()
+            )
+            response = await asyncio.to_thread(self._client.im.v1.message.list, request)
+            if response and getattr(response, "success", lambda: False)():
+                items = getattr(getattr(response, "data", None), "items", None)
+                if items and len(items) > 0:
+                    return getattr(items[0], "message_id", None)
+        except Exception as exc:
+            logger.debug("[Feishu] Failed to fetch last message in thread %s: %s", thread_id, exc)
+        return None
 
     async def _send_raw_message(
         self,
@@ -4471,7 +4832,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 uuid_value=str(uuid.uuid4()),
             )
             request = self._build_reply_message_request(effective_reply_to, body)
-            return await asyncio.to_thread(self._client.im.v1.message.reply, request)
+            return await self._run_blocking(self._client.im.v1.message.reply, request)
 
         # For topic/thread messages that fell back from reply→create, use
         # thread_id as receive_id so the message lands in the topic instead of
@@ -4501,7 +4862,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 uuid_value=str(uuid.uuid4()),
             )
             request = self._build_create_message_request(receive_id_type, body)
-        return await asyncio.to_thread(self._client.im.v1.message.create, request)
+        return await self._run_blocking(self._client.im.v1.message.create, request)
 
     @staticmethod
     def _response_succeeded(response: Any) -> bool:
@@ -4583,6 +4944,12 @@ class FeishuAdapter(BasePlatformAdapter):
             log_level=lark.LogLevel.INFO,
             event_handler=self._event_handler,
             domain=domain,
+            # Channel SDK signaling tag: without this UA tag the Feishu
+            # server does not push group @mention events over the WebSocket
+            # transport.  The tag tells the server to use the Channel protocol
+            # which enables group-message routing in addition to P2P DM.
+            # See https://github.com/NousResearch/hermes-agent/issues/50656
+            extra_ua_tags=["channel"],
         )
         self._ws_future = loop.run_in_executor(
             None,
@@ -4600,7 +4967,10 @@ class FeishuAdapter(BasePlatformAdapter):
         if self._event_handler is None:
             raise RuntimeError("failed to build Feishu event handler")
         await self._hydrate_bot_identity()
-        app = web.Application()
+        # client_max_size backstops the bounded reader in
+        # _handle_webhook_request; aiohttp then enforces the same cap on
+        # every read path (#58536/#58902/#59180 pattern).
+        app = web.Application(client_max_size=_FEISHU_WEBHOOK_MAX_BODY_BYTES)
         app.router.add_post(self._webhook_path, self._handle_webhook_request)
         self._webhook_runner = web.AppRunner(app)
         await self._webhook_runner.setup()
@@ -4701,19 +5071,19 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _build_get_chat_request(chat_id: str) -> Any:
-        if "GetChatRequest" in globals():
+        if GetChatRequest is not None:
             return GetChatRequest.builder().chat_id(chat_id).build()
         return SimpleNamespace(chat_id=chat_id)
 
     @staticmethod
     def _build_get_message_request(message_id: str) -> Any:
-        if "GetMessageRequest" in globals():
+        if GetMessageRequest is not None:
             return GetMessageRequest.builder().message_id(message_id).build()
         return SimpleNamespace(message_id=message_id)
 
     @staticmethod
     def _build_message_resource_request(*, message_id: str, file_key: str, resource_type: str) -> Any:
-        if "GetMessageResourceRequest" in globals():
+        if GetMessageResourceRequest is not None:
             return (
                 GetMessageResourceRequest.builder()
                 .message_id(message_id)
@@ -4725,7 +5095,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _build_get_application_request(*, app_id: str, lang: str) -> Any:
-        if "GetApplicationRequest" in globals():
+        if GetApplicationRequest is not None:
             return (
                 GetApplicationRequest.builder()
                 .app_id(app_id)
@@ -4736,7 +5106,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _build_reply_message_body(*, content: str, msg_type: str, reply_in_thread: bool, uuid_value: str) -> Any:
-        if "ReplyMessageRequestBody" in globals():
+        if ReplyMessageRequestBody is not None:
             return (
                 ReplyMessageRequestBody.builder()
                 .content(content)
@@ -4754,7 +5124,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _build_reply_message_request(message_id: str, request_body: Any) -> Any:
-        if "ReplyMessageRequest" in globals():
+        if ReplyMessageRequest is not None:
             return (
                 ReplyMessageRequest.builder()
                 .message_id(message_id)
@@ -4765,7 +5135,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _build_update_message_body(*, msg_type: str, content: str) -> Any:
-        if "UpdateMessageRequestBody" in globals():
+        if UpdateMessageRequestBody is not None:
             return (
                 UpdateMessageRequestBody.builder()
                 .msg_type(msg_type)
@@ -4776,7 +5146,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _build_update_message_request(message_id: str, request_body: Any) -> Any:
-        if "UpdateMessageRequest" in globals():
+        if UpdateMessageRequest is not None:
             return (
                 UpdateMessageRequest.builder()
                 .message_id(message_id)
@@ -4787,7 +5157,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _build_create_message_body(*, receive_id: str, msg_type: str, content: str, uuid_value: str) -> Any:
-        if "CreateMessageRequestBody" in globals():
+        if CreateMessageRequestBody is not None:
             return (
                 CreateMessageRequestBody.builder()
                 .receive_id(receive_id)
@@ -4805,7 +5175,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _build_create_message_request(receive_id_type: str, request_body: Any) -> Any:
-        if "CreateMessageRequest" in globals():
+        if CreateMessageRequest is not None:
             return (
                 CreateMessageRequest.builder()
                 .receive_id_type(receive_id_type)
@@ -4816,7 +5186,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _build_image_upload_body(*, image_type: str, image: Any) -> Any:
-        if "CreateImageRequestBody" in globals():
+        if CreateImageRequestBody is not None:
             return (
                 CreateImageRequestBody.builder()
                 .image_type(image_type)
@@ -4827,25 +5197,27 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _build_image_upload_request(request_body: Any) -> Any:
-        if "CreateImageRequest" in globals():
+        if CreateImageRequest is not None:
             return CreateImageRequest.builder().request_body(request_body).build()
         return SimpleNamespace(request_body=request_body)
 
     @staticmethod
-    def _build_file_upload_body(*, file_type: str, file_name: str, file: Any) -> Any:
-        if "CreateFileRequestBody" in globals():
-            return (
+    def _build_file_upload_body(*, file_type: str, file_name: str, file: Any, duration: int = 0) -> Any:
+        if CreateFileRequestBody is not None:
+            builder = (
                 CreateFileRequestBody.builder()
                 .file_type(file_type)
                 .file_name(file_name)
                 .file(file)
-                .build()
             )
-        return SimpleNamespace(file_type=file_type, file_name=file_name, file=file)
+            if duration > 0:
+                builder = builder.duration(duration)
+            return builder.build()
+        return SimpleNamespace(file_type=file_type, file_name=file_name, file=file, duration=duration)
 
     @staticmethod
     def _build_file_upload_request(request_body: Any) -> Any:
-        if "CreateFileRequest" in globals():
+        if CreateFileRequest is not None:
             return CreateFileRequest.builder().request_body(request_body).build()
         return SimpleNamespace(request_body=request_body)
 
@@ -5062,7 +5434,10 @@ def probe_bot(app_id: str, app_secret: str, domain: str) -> Optional[dict]:
     Note: ``bot_open_id`` here is the bot's app-scoped open_id — the same ID
     that Feishu puts in @mention payloads.  It is NOT the app_id.
     """
-    if FEISHU_AVAILABLE:
+    # The SDK import is deferred until connect(); onboarding runs before any
+    # connect, so load it here to keep the SDK probe path reachable rather
+    # than silently degrading every setup run to the HTTP fallback.
+    if _load_lark_oapi():
         return _probe_bot_sdk(app_id, app_secret, domain)
     return _probe_bot_http(app_id, app_secret, domain)
 
@@ -5229,7 +5604,7 @@ def _qr_register_inner(
 # ──────────────────────────────────────────────────────────────────────────
 
 _MIGRATION_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-_MIGRATION_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".3gp"}
+_MIGRATION_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 _MIGRATION_AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
 _MIGRATION_VOICE_EXTS = {".ogg", ".opus"}
 
@@ -5250,8 +5625,8 @@ async def _standalone_send(
     FeishuAdapter, hydrates its lark client, and sends text + native media
     (images, video, voice, documents). Replaces the legacy _send_feishu helper.
     """
-    if not FEISHU_AVAILABLE:
-        return {"error": "Feishu dependencies not installed. Run: pip install 'hermes-agent[feishu]'"}
+    if not await asyncio.to_thread(_load_lark_oapi):
+        return {"error": "Feishu dependencies not installed. Run `hermes setup` to install Feishu support."}
 
     media_files = media_files or []
     try:
@@ -5302,7 +5677,7 @@ def interactive_setup() -> None:
     Replaces the central _setup_feishu in hermes_cli/gateway.py and the static
     _PLATFORMS["feishu"] dict. CLI helpers are lazy-imported.
     """
-    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_cli.config import get_env_value, remove_env_value, save_env_value
     from hermes_cli.setup import prompt_choice
     from hermes_cli.cli_output import (
         prompt,
@@ -5453,10 +5828,17 @@ def interactive_setup() -> None:
         save_env_value("FEISHU_GROUP_POLICY", "disabled")
         print_info("Group chats disabled.")
 
-    home_channel = prompt("Home chat ID (optional, for cron/notifications)", password=False)
+    print_info(
+        "Leave blank to clear a previously saved home channel "
+        "(cron / notifications)."
+    )
+    home_channel = prompt("Home chat ID (optional, for cron/notifications)", password=False).strip()
     if home_channel:
         save_env_value("FEISHU_HOME_CHANNEL", home_channel)
         print_success(f"Home channel set to {home_channel}")
+    else:
+        if remove_env_value("FEISHU_HOME_CHANNEL"):
+            print_info("Home channel cleared.")
 
     print_success("🪽 Feishu / Lark configured!")
     print_info(f"App ID: {app_id}")
@@ -5495,11 +5877,12 @@ def register(ctx) -> None:
         name="feishu",
         label="Feishu / Lark",
         adapter_factory=_build_adapter,
-        check_fn=check_feishu_requirements,
+        check_fn=feishu_deps_present,
+        ensure_deps_fn=check_feishu_requirements,
         is_connected=_is_connected,
         validate_config=_is_connected,
         required_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"],
-        install_hint="pip install 'hermes-agent[feishu]'",
+        install_hint="Run `hermes setup` to install Feishu support.",
         setup_fn=interactive_setup,
         apply_yaml_config_fn=_apply_yaml_config,
         allowed_users_env="FEISHU_ALLOWED_USERS",

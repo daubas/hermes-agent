@@ -18,7 +18,7 @@ import { colorize } from './colorize.js'
 import App from './components/App.js'
 import type { CursorAdvanceNotifier } from './components/CursorAdvanceContext.js'
 import type { CursorDeclaration, CursorDeclarationSetter } from './components/CursorDeclarationContext.js'
-import { FRAME_INTERVAL_MS } from './constants.js'
+import { FRAME_INTERVAL_MS, MAX_COALESCED_BACKPRESSURE_FRAMES } from './constants.js'
 import * as dom from './dom.js'
 import { markDirty } from './dom.js'
 import { KeyboardEvent } from './events/keyboard-event.js'
@@ -205,6 +205,11 @@ export default class Ink {
   // (callback fired).
   private pendingWriteStart: number | null = null
   private lastDrainMs = 0
+  // Issue #31486: count of consecutive frames skipped because the previous
+  // write hadn't drained. Reset to 0 whenever a frame actually writes (or the
+  // pipe has drained). Capped by MAX_COALESCED_BACKPRESSURE_FRAMES so a
+  // never-firing drain callback can't coalesce forever.
+  private coalescedBackpressureFrames = 0
   private lastYogaCounters: {
     ms: number
     visited: number
@@ -595,6 +600,27 @@ export default class Ink {
     }, 160)
   }
 
+  private handleTerminalFocusChange(isFocused: boolean): void {
+    if (!isFocused || !this.options.stdout.isTTY) {
+      return
+    }
+
+    // Focus-in means the terminal emulator has just made this tab/pane
+    // visible again. Some emulators throttle or coalesce hidden-tab output;
+    // if we continue with the pre-blur virtual cursor/backbuffer, only the
+    // next small dirty region may repaint and stale status/progress rows can
+    // remain visible. Defer one tick so TerminalFocusProvider subscribers
+    // observe the new focus state first, then do the same recovery as /redraw.
+    queueMicrotask(() => {
+      if (this.isUnmounted || this.isPaused || !this.options.stdout.isTTY || this.currentNode === null) {
+        return
+      }
+
+      this.reassertTerminalModes(false)
+      this.forceRedraw()
+    })
+  }
+
   resolveExitPromise: () => void = () => {}
   rejectExitPromise: (reason?: Error) => void = () => {}
   unsubscribeExit: () => void = () => {}
@@ -702,6 +728,36 @@ export default class Ink {
       clearTimeout(this.drainTimer)
       this.drainTimer = null
     }
+
+    // Issue #31486 (stdout-backpressure strand): if the PREVIOUS frame's
+    // stdout.write still hasn't drained (callback hasn't fired —
+    // pendingWriteStart is non-null), the outer terminal is consuming bytes
+    // slower than we're producing them. Piling another write on the backed-up
+    // pipe is wasted work AND keeps the macrotask queue hot, which is what
+    // starves the stdin 'readable' callback and wedges input. Coalesce:
+    // skip this frame's render+write entirely and retry on the drain tick.
+    // The ceiling guarantees forward progress — after N coalesced frames we
+    // force the write through, so a terminal whose drain callback NEVER fires
+    // (e.g. OSError EIO on flush) self-heals once the pipe recovers instead of
+    // coalescing forever. Only on a TTY; piped stdout has no flow control and
+    // pendingWriteStart is never set there.
+    if (
+      this.options.stdout.isTTY &&
+      this.pendingWriteStart !== null &&
+      this.coalescedBackpressureFrames < MAX_COALESCED_BACKPRESSURE_FRAMES
+    ) {
+      this.coalescedBackpressureFrames += 1
+      this.isRendering = false
+      // Retry at the same cadence as a scroll drain tick. Don't use
+      // scheduleRender — lodash throttle's leading edge would re-enter here.
+      this.drainTimer = setTimeout(() => this.onRender(), FRAME_INTERVAL_MS >> 2)
+
+      return
+    }
+
+    // Either we wrote, or we hit the ceiling and are forcing a write through.
+    // Reset the coalesce counter so the next backpressure episode starts fresh.
+    this.coalescedBackpressureFrames = 0
 
     // Flush deferred interaction-time update before rendering so we call
     // Date.now() at most once per frame instead of once per keypress.
@@ -1099,7 +1155,13 @@ export default class Ink {
     const { bytes: writeBytes, backpressure } = writeDiffToTerminal(
       this.terminal,
       optimized,
-      this.altScreenActive && !SYNC_OUTPUT_SUPPORTED,
+      // Never emit BSU/ESU (DEC 2026) on terminals that don't support it —
+      // main screen included. Multiplexers like Zellij re-parse and re-chunk
+      // the stream with their own timing, so the markers buy no atomicity and
+      // stale frames get pushed into main-screen scrollback as repeated
+      // chrome (#66490). Supported terminals keep today's behavior on both
+      // screens (skip=false → BSU/ESU wrapped).
+      !SYNC_OUTPUT_SUPPORTED,
       trackDrain
         ? () => {
             // Callback fires once Node has flushed the chunk to the OS.
@@ -1305,6 +1367,18 @@ export default class Ink {
   }
   get isAltScreenActive(): boolean {
     return this.altScreenActive
+  }
+
+  /**
+   * True while the terminal is expected to have DEC mouse tracking armed:
+   * alt screen active, not paused for an editor handoff, and the current
+   * preset isn't 'off'. Gates App's mouse-mode watchdog (DECRQM probe) so
+   * it never probes when tracking is intentionally disabled (/mouse off),
+   * during pause (probe bytes would leak into the external editor's
+   * session), or after unmount.
+   */
+  get expectsMouseTracking(): boolean {
+    return this.altScreenActive && !this.isPaused && !this.isUnmounted && this.altScreenMouseTracking !== 'off'
   }
 
   /**
@@ -2351,6 +2425,7 @@ export default class Ink {
         onSelectionChange={this.notifySelectionChange}
         onSelectionDrag={this.handleSelectionDrag}
         onStdinResume={this.reassertTerminalModes}
+        onTerminalFocusChange={this.handleTerminalFocusChange}
         selection={this.selection}
         stderr={this.options.stderr}
         stdin={this.options.stdin}

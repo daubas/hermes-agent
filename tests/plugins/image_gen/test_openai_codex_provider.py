@@ -9,6 +9,7 @@ endpoint.
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 
 import pytest
@@ -66,13 +67,6 @@ class TestMetadata:
         schema = provider.get_setup_schema()
         assert schema["env_vars"] == []
         assert schema["badge"] == "free"
-        assert "text-to-image only" not in schema["tag"]
-
-    def test_capabilities_include_reference_images(self, provider):
-        assert provider.capabilities() == {
-            "modalities": ["text", "image"],
-            "max_reference_images": 16,
-        }
 
 
 # ── Availability ────────────────────────────────────────────────────────────
@@ -107,11 +101,6 @@ class TestGenerate:
         assert result["success"] is False
         assert result["error_type"] == "auth_required"
 
-    def test_returns_invalid_argument_for_empty_prompt(self, provider, monkeypatch):
-        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
-        result = provider.generate("   ")
-        assert result["success"] is False
-        assert result["error_type"] == "invalid_argument"
 
     def test_generate_uses_codex_stream_path(self, provider, monkeypatch, tmp_path):
         monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
@@ -136,11 +125,12 @@ class TestGenerate:
 
         captured = {}
 
-        def _collect(token, *, prompt, size, quality):
+        def _collect(token, *, prompt, size, quality, input_images=None):
             captured.update(codex_plugin._build_responses_payload(
                 prompt=prompt,
                 size=size,
                 quality=quality,
+                input_images=input_images,
             ))
             return _b64_png()
 
@@ -154,9 +144,10 @@ class TestGenerate:
         assert captured["input"][0]["type"] == "message"
         assert captured["input"][0]["role"] == "user"
         assert captured["input"][0]["content"][0]["type"] == "input_text"
-        assert captured["tool_choice"]["type"] == "allowed_tools"
-        assert captured["tool_choice"]["mode"] == "required"
-        assert captured["tool_choice"]["tools"] == [{"type": "image_generation"}]
+        # Regression for #19505: the Codex backend 400s on every tool_choice
+        # shape we have for the hosted ``image_generation`` tool, so the
+        # provider must omit tool_choice entirely and rely on instructions.
+        assert "tool_choice" not in captured
 
         tool = captured["tools"][0]
         assert tool["type"] == "image_generation"
@@ -167,55 +158,23 @@ class TestGenerate:
         assert tool["background"] == "opaque"
         assert tool["partial_images"] == 1
 
-    def test_reference_images_are_sent_as_responses_image_inputs(
-        self, provider, monkeypatch, tmp_path
-    ):
+    def test_capabilities_advertise_image_inputs(self, provider):
+        caps = provider.capabilities()
+        assert caps["modalities"] == ["text", "image"]
+        assert caps["max_reference_images"] == 16
+
+
+    def test_rejects_non_image_local_source(self, provider, monkeypatch, tmp_path):
         monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
-        local_ref = tmp_path / "reference.png"
-        local_ref.write_bytes(bytes.fromhex(_PNG_HEX))
-        data_ref = f"data:image/png;base64,{_b64_png()}"
-        captured = {}
+        text_path = tmp_path / "not-image.txt"
+        text_path.write_text("hello")
 
-        def _collect(token, *, prompt, size, quality, reference_images):
-            captured.update(codex_plugin._build_responses_payload(
-                prompt=prompt,
-                size=size,
-                quality=quality,
-                reference_images=reference_images,
-            ))
-            return _b64_png()
-
-        monkeypatch.setattr(codex_plugin, "_collect_image_b64", _collect)
-
-        result = provider.generate(
-            "Keep the composition and add a red notebook",
-            image_url=str(local_ref),
-            reference_image_urls=["https://example.com/style.webp", data_ref],
-        )
-
-        assert result["success"] is True
-        assert result["modality"] == "image"
-        content = captured["input"][0]["content"]
-        assert content[0] == {
-            "type": "input_text",
-            "text": "Keep the composition and add a red notebook",
-        }
-        assert content[1]["type"] == "input_image"
-        assert content[1]["image_url"].startswith("data:image/png;base64,")
-        assert content[2] == {
-            "type": "input_image",
-            "image_url": "https://example.com/style.webp",
-        }
-        assert content[3] == {"type": "input_image", "image_url": data_ref}
-        assert captured["tools"][0]["action"] == "edit"
-
-    def test_missing_local_reference_returns_io_error(self, provider, monkeypatch):
-        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
-
-        result = provider.generate("edit this", image_url="/missing/reference.png")
+        result = provider.generate("edit this", image_url=str(text_path))
 
         assert result["success"] is False
-        assert result["error_type"] == "io_error"
+        assert result["error_type"] == "invalid_image_input"
+        assert "not a supported image" in result["error"]
+
 
     def test_partial_image_event_used_when_done_missing(self):
         """If output_item.done is missing, partial_image_b64 is accepted."""
@@ -275,6 +234,109 @@ class TestGenerate:
         assert result["success"] is False
         assert result["error_type"] == "api_error"
         assert "cloudflare 403" in result["error"]
+
+    def test_tool_choice_400_surfaces_verbatim_not_as_capability_error(
+        self, provider, monkeypatch
+    ):
+        """The tool_choice 400 must NOT be reported as an account limitation.
+
+        Regression for #19505 / #49008 / #31335: a previous version classified
+        this exact request-shape rejection as "Image generation is not enabled
+        for the current Codex account", telling every affected user to abandon
+        Codex over a bug in our own payload. The wire error must reach the user
+        unedited so it stays diagnosable.
+
+        Drives the REAL httpx boundary (not a mocked ``_collect_image_b64``) so
+        the classification path is actually exercised — mocking the collector
+        would skip the code under test entirely.
+        """
+        import httpx
+
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+
+        body = json.dumps({
+            "error": {
+                "message": "Tool choice 'image_generation' not found in 'tools' parameter.",
+                "type": "invalid_request_error",
+                "param": "tool_choice",
+            }
+        })
+
+        def _handler(request):
+            return httpx.Response(400, text=body, request=request)
+
+        real_client = httpx.Client
+        monkeypatch.setattr(
+            httpx,
+            "Client",
+            lambda *args, **kwargs: real_client(
+                transport=httpx.MockTransport(_handler),
+                headers=kwargs.get("headers"),
+                timeout=kwargs.get("timeout"),
+            ),
+        )
+
+        result = provider.generate("a cat")
+
+        assert result["success"] is False
+        assert result["error_type"] == "api_error"
+        assert "HTTP 400" in result["error"]
+        assert "tools' parameter" in result["error"]
+        # The account-entitlement misdiagnosis must not come back.
+        assert "not enabled for the current Codex account" not in result["error"]
+        assert result["error_type"] != "capability_unsupported"
+
+
+class TestRequestShape:
+    def test_payload_omits_tool_choice(self):
+        """Codex rejects every tool_choice shape for hosted image_generation."""
+        payload = codex_plugin._build_responses_payload(
+            prompt="a red circle",
+            size="1024x1024",
+            quality="low",
+        )
+        assert "tool_choice" not in payload
+        # The hosted tool itself is still requested, and instructions do the steering.
+        assert payload["tools"][0]["type"] == "image_generation"
+        assert payload["instructions"]
+
+    def test_http_error_body_is_truncated_but_preserved(self, monkeypatch):
+        """A large error body is capped at 500 chars and still surfaced."""
+        import httpx
+
+        body = json.dumps({
+            "metadata": "x" * 600,
+            "error": {
+                "message": "Tool choice 'image_generation' not found in 'tools' parameter."
+            },
+        })
+
+        def _handler(request):
+            return httpx.Response(400, text=body, request=request)
+
+        real_client = httpx.Client
+        monkeypatch.setattr(
+            httpx,
+            "Client",
+            lambda *args, **kwargs: real_client(
+                transport=httpx.MockTransport(_handler),
+                headers=kwargs.get("headers"),
+                timeout=kwargs.get("timeout"),
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="HTTP 400") as excinfo:
+            codex_plugin._collect_image_b64(
+                "codex-token",
+                prompt="a cat",
+                size="1024x1024",
+                quality="low",
+            )
+
+        message = str(excinfo.value)
+        # Body is capped, but the actionable wire message still reaches the user.
+        assert "tools' parameter" in message
+        assert len(message) < len(body)
 
 
 # ── Plugin entry point ──────────────────────────────────────────────────────

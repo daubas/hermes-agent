@@ -4,11 +4,19 @@ import { useMemo, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle
+} from '@/components/ui/dialog'
 import type { HermesGitWorktree } from '@/global'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { $dismissedWorktreeIds, dismissWorktree } from '@/store/layout'
+import { displayPath } from '@/lib/display-path'
+import { $dismissedWorktreeIds, dismissWorktree, setWorkspaceNodeOpen } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import { removeWorktreePath } from '@/store/projects'
 
@@ -46,6 +54,12 @@ export function EnteredProjectContent({
 }) {
   if (!project.repos.length) {
     return null
+  }
+
+  // Home's rows aren't anchored to a folder, so there's no repo or worktree
+  // structure to show — just the chats.
+  if (project.isNoProject) {
+    return <>{renderRows(project.repos.flatMap(repo => repo.groups.flatMap(group => group.sessions)))}</>
   }
 
   const single = project.repos.length === 1
@@ -122,10 +136,9 @@ function RepoFlatSection({
   // A live `git worktree list` hit wins over an old dismissal: if git says the
   // worktree exists again (or still exists after "hide from sidebar"), surface it.
   const ordered = overlaidGroups.filter(
-    group => group.isMain || !dismissedWorktrees.includes(group.id) || (group.path && discoveredWorktreePaths.has(group.path))
+    group =>
+      group.isMain || !dismissedWorktrees.includes(group.id) || (group.path && discoveredWorktreePaths.has(group.path))
   )
-
-  const repoCount = ordered.reduce((sum, group) => sum + group.sessions.length, 0)
 
   // Removal asks how: actually `git worktree remove` it, or just hide the lane
   // and leave the worktree on disk. A dirty worktree escalates to a force prompt
@@ -248,15 +261,24 @@ function RepoFlatSection({
     <SidebarRowStack>
       <WorkspaceHeader
         action={
-          onNewSession && <WorkspaceAddButton label={s.newSessionIn(repo.label)} onClick={() => onNewSession(repo.path)} />
+          onNewSession && (
+            <WorkspaceAddButton
+              label={s.newSessionIn(repo.label)}
+              onClick={() => {
+                // Reveal the repo the new session targets if the user had it
+                // collapsed — the session lands in one of its lanes.
+                setWorkspaceNodeOpen(repo.id, true)
+                onNewSession(repo.path)
+              }}
+            />
+          )
         }
-        count={repoCount}
         emphasis
         icon={<Codicon className="shrink-0 text-(--ui-text-tertiary)" name="repo" size="0.75rem" />}
         label={repo.label}
         onToggle={toggleOpen}
         open={open}
-        title={repo.path ?? undefined}
+        title={repo.path ? displayPath(repo.path) : undefined}
       />
       {open && <SidebarRowStack className="pl-2.5">{body}</SidebarRowStack>}
       {removeDialog}

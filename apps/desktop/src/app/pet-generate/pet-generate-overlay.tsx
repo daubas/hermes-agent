@@ -66,7 +66,14 @@ export function PetGenerateOverlay() {
   const working = status === 'generating' || status === 'hatching'
   const errored = status === 'error' && drafts.length === 0
   const stepOne = status === 'idle' || status === 'ready'
-  const banner = errored ? error || copy.genericError : working ? copy.backgroundHint : stepOne ? copy.slowProviderHint : undefined
+
+  const banner = errored
+    ? error || copy.genericError
+    : working
+      ? copy.backgroundHint
+      : stepOne
+        ? copy.slowProviderHint
+        : undefined
 
   return (
     <Dialog onOpenChange={handleOpenChange} open={open}>
@@ -74,9 +81,10 @@ export function PetGenerateOverlay() {
         aria-describedby={undefined}
         banner={banner}
         bannerTone={errored ? 'error' : 'info'}
+        bodyClassName="gap-4 text-center"
         // Cap the width so a long banner (e.g. a provider refusal) wraps instead
         // of stretching the dialog out; the min-w floors each phase.
-        className={cn('gap-4 text-center', single ? 'min-w-[17rem] max-w-[20rem]' : 'min-w-[19rem] max-w-[22rem]')}
+        className={cn(single ? 'min-w-[17rem] max-w-[20rem]' : 'min-w-[19rem] max-w-[22rem]')}
         fitContent
       >
         {open && <PetGenerateContent />}
