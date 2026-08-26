@@ -20,6 +20,7 @@ import hashlib
 import hmac
 import base64
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -124,6 +125,98 @@ class TestDedup:
     def test_first_event_not_duplicate(self):
         d = _MessageDeduplicator()
         assert not d.is_duplicate("evt1")
+
+
+class TestWebhookRedelivery:
+
+    @staticmethod
+    def _adapter(tmp_path):
+        from gateway.config import PlatformConfig
+
+        return LineAdapter(PlatformConfig(enabled=True, extra={
+            "channel_access_token": "tok",
+            "channel_secret": "sec",
+            "allow_all_users": True,
+            "sent_message_ids_path": str(tmp_path / "sent-message-ids.json"),
+        }))
+
+    @staticmethod
+    def _request(events):
+        body = json.dumps({"events": events}).encode()
+        request = MagicMock()
+        request.read = AsyncMock(return_value=body)
+        request.headers = {
+            "X-Line-Signature": base64.b64encode(
+                hmac.new(b"sec", body, hashlib.sha256).digest()
+            ).decode()
+        }
+        return request
+
+    def test_partial_failure_returns_500_and_retry_only_reprocesses_failed_event(
+        self, tmp_path,
+    ):
+        adapter = self._adapter(tmp_path)
+        attempts = {"evt-ok": 0, "evt-retry": 0}
+
+        async def handle(event):
+            event_id = event.raw_message["webhookEventId"]
+            attempts[event_id] += 1
+            if event_id == "evt-retry" and attempts[event_id] == 1:
+                raise RuntimeError("transient failure")
+
+        adapter.handle_message = AsyncMock(side_effect=handle)
+        events = [
+            {
+                "type": "message",
+                "webhookEventId": event_id,
+                "replyToken": f"reply-{event_id}",
+                "source": {"type": "user", "userId": "U1"},
+                "message": {"id": f"message-{event_id}", "type": "text", "text": "hi"},
+            }
+            for event_id in attempts
+        ]
+
+        first = asyncio.run(adapter._handle_webhook(self._request(events)))
+        second = asyncio.run(adapter._handle_webhook(self._request(events)))
+
+        assert first.status == 500
+        assert second.status == 200
+        assert attempts == {"evt-ok": 1, "evt-retry": 2}
+
+    def test_completed_event_stays_deduplicated_after_adapter_restart(self, tmp_path):
+        event = {
+            "type": "message",
+            "webhookEventId": "evt-persisted",
+            "replyToken": "reply-token",
+            "source": {"type": "user", "userId": "U1"},
+            "message": {"id": "message-1", "type": "text", "text": "hi"},
+        }
+        first = self._adapter(tmp_path)
+        first.handle_message = AsyncMock()
+        asyncio.run(first._dispatch_event(event))
+
+        restarted = self._adapter(tmp_path)
+        restarted.handle_message = AsyncMock()
+        asyncio.run(restarted._dispatch_event(event))
+
+        restarted.handle_message.assert_not_awaited()
+
+    def test_inflight_redelivery_returns_500_instead_of_being_acknowledged(self, tmp_path):
+        adapter = self._adapter(tmp_path)
+        adapter.handle_message = AsyncMock()
+        event = {
+            "type": "message",
+            "webhookEventId": "evt-inflight",
+            "replyToken": "reply-token",
+            "source": {"type": "user", "userId": "U1"},
+            "message": {"id": "message-1", "type": "text", "text": "hi"},
+        }
+        assert adapter._dedup.claim("evt-inflight")
+
+        response = asyncio.run(adapter._handle_webhook(self._request([event])))
+
+        assert response.status == 500
+        adapter.handle_message.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +324,35 @@ class TestInboundMedia:
         assert event.media_urls == ["/cache/image.jpg"]
         assert event.media_types == ["image/jpeg"]
 
+    def test_pdf_file_uses_document_cache_and_pdf_mime(self, adapter):
+        adapter._client.fetch_content.return_value = b"%PDF-1.4\n"
+        with patch.object(
+            _line,
+            "cache_document_from_bytes",
+            return_value="/cache/statement.pdf",
+        ) as cache:
+            asyncio.run(adapter._handle_message_event(
+                self._event("file", fileName="statement.pdf")
+            ))
+
+        cache.assert_called_once_with(b"%PDF-1.4\n", "statement.pdf")
+        event = self._captured_event(adapter)
+        assert event.media_urls == ["/cache/statement.pdf"]
+        assert event.media_types == ["application/pdf"]
+
+    def test_oversized_file_is_not_downloaded_and_agent_is_told(self, adapter):
+        asyncio.run(adapter._handle_message_event(self._event(
+            "file",
+            fileName="large.pdf",
+            fileSize=10 * 1024 * 1024 + 1,
+        )))
+
+        adapter._client.fetch_content.assert_not_awaited()
+        event = self._captured_event(adapter)
+        assert event.media_urls == []
+        assert "not saved" in event.text
+        assert "10 MB" in event.text
+
 
 # ---------------------------------------------------------------------------
 # 8. Send routing (reply -> push fallback, batching, system-bypass)
@@ -282,6 +404,60 @@ class TestSendRouting:
         assert adapter._has_required_mention(
             "follow up", {"quotedMessageId": "bot-message-1"}
         )
+
+    def test_reply_to_sent_bot_message_includes_its_text(self, adapter):
+        import time as _time
+
+        adapter.require_mention = True
+        adapter.observe_unmentioned_group_messages = True
+        adapter.handle_message = AsyncMock()
+        adapter._reply_tokens["Cgroup"] = ("rt-token", _time.time() + 30)
+        adapter._client.reply.return_value = ["bot-message-1"]
+        asyncio.run(adapter.send("Cgroup", "中華電信費 $656，請回覆確認"))
+
+        asyncio.run(adapter._handle_message_event({
+            "replyToken": "next-reply-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Ualice"},
+            "message": {
+                "id": "user-message-1",
+                "type": "text",
+                "quotedMessageId": "bot-message-1",
+                "text": "確認",
+            },
+        }))
+
+        forwarded = adapter.handle_message.await_args.args[0]
+        assert forwarded.reply_to_text == "中華電信費 $656，請回覆確認"
+
+    def test_dm_reply_to_recorded_pdf_attaches_document(self, adapter, tmp_path):
+        adapter.handle_message = AsyncMock()
+        adapter._client.loading = AsyncMock()
+        adapter.workbench_media_log = str(tmp_path / "workbench-media.jsonl")
+        pdf_path = tmp_path / "statement.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4\n")
+        adapter._record_workbench_media(
+            chat_id="Ualice",
+            chat_type="dm",
+            user_id="Ualice",
+            message_id="pdf-message-1",
+            msg_type="file",
+            local_path=str(pdf_path),
+        )
+
+        asyncio.run(adapter._handle_message_event({
+            "replyToken": "reply-token",
+            "source": {"type": "user", "userId": "Ualice"},
+            "message": {
+                "id": "user-message-1",
+                "type": "text",
+                "quotedMessageId": "pdf-message-1",
+                "text": "內容",
+            },
+        }))
+
+        forwarded = adapter.handle_message.await_args.args[0]
+        assert forwarded.media_urls == [str(pdf_path)]
+        assert forwarded.media_types == ["application/pdf"]
 
     def test_group_response_quotes_the_triggering_user_message(self, adapter):
         import time as _time
@@ -346,13 +522,20 @@ class TestSendRouting:
         assert shared_source.user_id is None
         observed = adapter._session_store.append_to_transcript.call_args.args[1]
         assert observed["observed"] is True
-        assert "Ualice" in observed["content"]
-        assert "Alice 的普通群組發言" in observed["content"]
+        assert observed["content"] == (
+            "[Trusted LINE source: sender_id=Ualice; scope_id=Cgroup; "
+            "source_event_id=line:message:message-1]\n"
+            "Alice 的普通群組發言"
+        )
         assert "Cgroup" not in adapter._reply_tokens
 
-    def test_unmentioned_bookkeeping_command_is_dispatched(self, adapter):
+    def test_unmentioned_bookkeeping_command_is_observed_without_dispatch(self, adapter):
         adapter.require_mention = True
         adapter.observe_unmentioned_group_messages = True
+        adapter._session_store = MagicMock()
+        adapter._session_store.get_or_create_session.return_value = MagicMock(
+            session_id="shared-group-session"
+        )
         adapter.handle_message = AsyncMock()
 
         asyncio.run(adapter._handle_message_event({
@@ -361,7 +544,8 @@ class TestSendRouting:
             "message": {"id": "message-1", "type": "text", "text": "記帳 午餐 125"},
         }))
 
-        assert adapter.handle_message.await_args.args[0].text.endswith("記帳 午餐 125")
+        adapter.handle_message.assert_not_awaited()
+        adapter._session_store.append_to_transcript.assert_called_once()
 
     def test_bare_unmentioned_bookkeeping_word_stays_observed(self, adapter):
         adapter.require_mention = True
@@ -385,6 +569,7 @@ class TestSendRouting:
         adapter.require_mention = True
         adapter.observe_unmentioned_group_messages = True
         adapter.handle_message = AsyncMock()
+        adapter._remember_sent_message_ids(["quoted-message"])
 
         asyncio.run(adapter._handle_message_event({
             "replyToken": "reply-token",
@@ -435,6 +620,7 @@ class TestSendRouting:
             "source_event_id=line:message:trigger-message]\n"
         )
         assert "observed LINE group context" in forwarded.channel_prompt
+        assert "identify context authors" in forwarded.channel_prompt
         assert "first Trusted LINE source line" in forwarded.channel_prompt
         assert forwarded.reply_to_message_id == "bot-message-1"
         assert forwarded.reply_to_is_own_message is True
@@ -556,6 +742,51 @@ class TestSendRouting:
             build_session_key(forwarded.source, group_sessions_per_user=False)
         ) == [str(image_path)]
 
+    def test_group_reply_refetches_quoted_image_missing_from_webhook(
+        self, adapter, monkeypatch, tmp_path,
+    ):
+        adapter.require_mention = True
+        adapter.observe_unmentioned_group_messages = True
+        adapter.handle_message = AsyncMock()
+        adapter._session_store = MagicMock()
+        adapter._session_store.get_or_create_session.return_value = MagicMock(
+            session_id="shared-group-session"
+        )
+        adapter._session_store.load_transcript.return_value = []
+        adapter._session_store.find_platform_message.return_value = None
+        adapter._client.fetch_content = AsyncMock(
+            return_value=b"\xff\xd8\xff\xe0quoted-image"
+        )
+        adapter.workbench_media_log = str(tmp_path / "workbench-media.jsonl")
+        monkeypatch.setenv("IMAGE_CACHE_DIR", str(tmp_path / "images"))
+        mention_text = "@Methu"
+
+        asyncio.run(adapter._handle_message_event({
+            "replyToken": "trigger-reply-token",
+            "source": {"type": "group", "groupId": "Cgroup", "userId": "Ubob"},
+            "message": {
+                "id": "trigger-message",
+                "type": "text",
+                "quotedMessageId": "quoted-image",
+                "text": mention_text,
+                "mention": {"mentionees": [{
+                    "index": 0,
+                    "length": len(mention_text),
+                    "isSelf": True,
+                }]},
+            },
+        }))
+
+        adapter._client.fetch_content.assert_awaited_once_with("quoted-image")
+        forwarded = adapter.handle_message.await_args.args[0]
+        assert len(forwarded.media_urls) == 1
+        assert forwarded.media_types == ["image/jpeg"]
+        assert Path(forwarded.media_urls[0]).read_bytes() == b"\xff\xd8\xff\xe0quoted-image"
+        media_entry = json.loads(
+            (tmp_path / "workbench-media.jsonl").read_text().strip()
+        )
+        assert media_entry["source_message_id"] == "quoted-image"
+
     def test_group_reply_resolves_observed_message_after_session_reset(self, adapter, tmp_path):
         from gateway.config import GatewayConfig
         from gateway.session import SessionStore
@@ -674,7 +905,10 @@ class TestSendRouting:
         )
 
     def test_sent_message_ids_survive_adapter_restart(self, adapter, tmp_path):
-        adapter._remember_sent_message_ids(["bot-message-1"])
+        adapter._remember_sent_message_ids(
+            ["bot-message-1"],
+            [{"type": "text", "text": "中華電信費 $656，請回覆確認"}],
+        )
         from gateway.config import PlatformConfig
         restarted = LineAdapter(PlatformConfig(enabled=True, extra={
             "channel_access_token": "tok",
@@ -685,6 +919,9 @@ class TestSendRouting:
         assert restarted._has_required_mention(
             "follow up", {"quotedMessageId": "bot-message-1"}
         )
+        assert restarted._group_reply_text(
+            "Cgroup", "group", "bot-message-1"
+        ) == "中華電信費 $656，請回覆確認"
 
     def test_group_mention_workbench_command_only_opens_workbench(self, adapter):
         mention_text = "@厲害的瑪土撒拉"
@@ -1054,15 +1291,30 @@ class TestSendRouting:
         adapter._client.push.assert_not_called()
         assert adapter._cache.get(rid).state is State.READY
         assert adapter._cache.get(rid).payload == "the answer"
-        assert "Uchat" not in adapter._pending_buttons
+        assert adapter._pending_buttons["Uchat"] == rid
+
+    def test_tokenless_followup_appends_to_ready_workbench_handoff(self, adapter):
+        rid = adapter._cache.register_pending("Uchat")
+        adapter._pending_buttons["Uchat"] = rid
+
+        first = asyncio.run(adapter.send("Uchat", "the answer"))
+        followup = asyncio.run(adapter.send("Uchat", "background result"))
+
+        assert first.success and followup.success
+        adapter._client.reply.assert_not_called()
+        adapter._client.push.assert_not_called()
+        assert adapter._cache.get(rid).payload == "the answer\n\nbackground result"
 
     def test_next_turn_replies_in_line_after_handoff_becomes_ready(self, adapter):
-        import time as _time
         rid = adapter._cache.register_pending("Uchat")
         adapter._pending_buttons["Uchat"] = rid
         asyncio.run(adapter.send("Uchat", "the handoff answer"))
         adapter._client.reply.reset_mock()
-        adapter._reply_tokens["Uchat"] = ("next-reply-token", _time.time() + 30)
+        adapter._stash_reply_context(
+            chat_id="Uchat",
+            message_id="next-message",
+            reply_token="next-reply-token",
+        )
 
         result = asyncio.run(adapter.send("Uchat", "the next answer"))
 
@@ -1449,7 +1701,9 @@ class TestPostbackButtonShape:
         )
         actions = msg["template"]["actions"]
         assert [action["type"] for action in actions] == ["uri", "postback"]
-        assert actions[0]["label"] == "開啟工作臺"
+        assert actions[0]["label"] == "去工作臺看看"
+        assert actions[1]["label"] == "看看好了沒"
+        assert actions[1]["displayText"] == "看看好了沒"
         assert json.loads(actions[1]["data"]) == {
             "action": "show_response",
             "request_id": "rid-1",
